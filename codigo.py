@@ -110,4 +110,11 @@ def synthesize_table_v1(
     
     # Monta pandas DF e devolve como Spark DF preservando schema original
     pdf = pd.DataFrame(data)[columns]  # mantém ordem
+    
+    # Força datetime64[ns] nas colunas de data/timestamp ===
+    for f in sdf.schema.fields:
+        if isinstance(f.dataType, (T.DateType, T.TimestampType)):
+            # Converte pra datetime64[ns] explicitamente
+            pdf[f.name] = pd.to_datetime(pdf[f.name], errors="coerce").astype("datetime64[ns]")
+    
     return spark.createDataFrame(pdf, schema=sdf.schema)

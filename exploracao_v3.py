@@ -21,6 +21,7 @@ Comportamento importante desta versão:
 
 Exemplos de relacionamento ignorado com warning:
     - parent_table declarado não está em specs/tables/table_paths;
+    - parent_table não foi informado e não pôde ser inferido;
     - coluna FK não existe na tabela filha;
     - parent_column não existe na tabela pai;
     - FK e parent_columns têm tamanhos diferentes;
@@ -1297,38 +1298,155 @@ def _normalize_cols(value: Any, *, field_name: str, table_name: str) -> Tuple[st
     return out
 
 
+def _try_normalize_cols(
+    value: Any,
+    *,
+    field_name: str,
+    table_name: str,
+    fk_index: Optional[int] = None,
+) -> Optional[Tuple[str, ...]]:
+    """
+    Versão tolerante de _normalize_cols.
+
+    Retorna None quando o campo não existe ou está vazio.
+    Isso permite avisar e ignorar apenas a FK problemática sem parar o código.
+    """
+    try:
+        return _normalize_cols(value, field_name=field_name, table_name=table_name)
+    except Exception as exc:
+        suffix = f" FK #{fk_index}" if fk_index is not None else ""
+        warnings.warn(
+            f"Configuração de relacionamento ignorada em `{table_name}`{suffix}: "
+            f"campo `{field_name}` inválido. Motivo: {exc}",
+            UserWarning,
+            stacklevel=2,
+        )
+        return None
+
+
+def _infer_parent_table_from_config(
+    specs_config: Mapping[str, Mapping],
+    *,
+    child_table: str,
+    parent_columns: Optional[Tuple[str, ...]],
+    child_fk_columns: Optional[Tuple[str, ...]],
+) -> Tuple[Optional[str], Optional[Tuple[str, ...]], str]:
+    """
+    Tenta inferir parent_table quando ele não foi informado na FK.
+
+    Estratégia:
+        1. Se parent_columns foi informado, procura uma tabela cuja pk_cols seja
+           exatamente igual a parent_columns.
+        2. Se parent_columns não foi informado, usa child_fk_columns como pista
+           e procura uma tabela cuja pk_cols seja exatamente igual a child_fk_columns.
+        3. Se houver match único, retorna a tabela inferida.
+        4. Se houver zero ou múltiplos matches, retorna None e motivo amigável.
+
+    Observação:
+        A inferência é conservadora de propósito. Se ficar ambígua, a FK é ignorada
+        com warning para evitar relacionamento errado.
+    """
+    candidates: List[str] = []
+    target_cols = parent_columns or child_fk_columns
+
+    if not target_cols:
+        return None, None, "não foi possível inferir: parent_table e parent_columns ausentes"
+
+    for candidate_table, cfg in specs_config.items():
+        if candidate_table == child_table:
+            continue
+        if not isinstance(cfg, ABCMapping):
+            continue
+        raw_pk = cfg.get("pk_cols")
+        if raw_pk is None:
+            continue
+        try:
+            pk_cols = _normalize_cols(
+                raw_pk,
+                field_name="pk_cols",
+                table_name=str(candidate_table),
+            )
+        except Exception:
+            continue
+        if tuple(pk_cols) == tuple(target_cols):
+            candidates.append(str(candidate_table))
+
+    if len(candidates) == 1:
+        inferred_parent_table = candidates[0]
+        inferred_parent_columns = tuple(target_cols)
+        return (
+            inferred_parent_table,
+            inferred_parent_columns,
+            f"parent_table inferido automaticamente como `{inferred_parent_table}` "
+            f"porque pk_cols={list(inferred_parent_columns)}",
+        )
+
+    if not candidates:
+        return (
+            None,
+            None,
+            "parent_table ausente e nenhuma tabela candidata foi encontrada "
+            f"com pk_cols={list(target_cols)}",
+        )
+
+    return (
+        None,
+        None,
+        "parent_table ausente e a inferência ficou ambígua; "
+        f"candidatos com pk_cols={list(target_cols)}: {candidates}",
+    )
+
+
 def _build_specs_from_config(
     specs_config: Mapping[str, Mapping],
     postprocess_by_table: Optional[Mapping[str, PostProcessor]] = None,
+    *,
+    relationship_policy: RelationshipPolicy = "warn_and_skip",
 ) -> Dict[str, TableSpec]:
     """
     Converte dicionário declarativo em specs tipados.
 
-    Aceita por tabela:
+    Regras desta versão:
+        - pk_cols continua obrigatório por tabela.
+        - foreign_keys é opcional.
+        - Dentro de cada FK, parent_table NÃO é mais obrigatório.
+        - Se parent_table não vier, o código tenta inferir pelo pk_cols do pai.
+        - Se não conseguir inferir, avisa e ignora somente aquela FK.
+        - Se coluna FK/parent_column não existir depois no schema, avisa e ignora
+          somente aquela FK na etapa de saneamento.
+
+    Formatos aceitos:
         {
-            "pk_cols": [...],
-            "static": bool,
-            "foreign_keys": [
-                {
-                    "columns": [...],
-                    "parent_table": "...",
-                    "parent_columns": [...]
-                }
-            ]
+            "tabela_filha": {
+                "pk_cols": ["ID_FILHO"],
+                "foreign_keys": [
+                    {
+                        "columns": ["ID_PAI"],
+                        "parent_table": "tabela_pai",          # opcional
+                        "parent_columns": ["ID_PAI"]           # opcional se parent_table tiver pk_cols
+                    }
+                ]
+            }
         }
     """
     if not isinstance(specs_config, ABCMapping) or not specs_config:
         raise ValueError("`specs_config` deve ser um dicionário não vazio.")
 
+    if relationship_policy not in ("warn_and_skip", "raise"):
+        raise ValueError("relationship_policy deve ser 'warn_and_skip' ou 'raise'.")
+
     postprocess_by_table = dict(postprocess_by_table or {})
     specs: Dict[str, TableSpec] = {}
 
     for name, cfg in specs_config.items():
+        name = str(name).strip()
+
         if not isinstance(cfg, ABCMapping):
             raise TypeError(
                 f"Config da tabela `{name}` deve ser um dict, recebido {type(cfg)!r}."
             )
 
+        # PK é estrutural para a geração. Sem PK não é seguro sintetizar.
         pk_cols = _normalize_cols(
             cfg.get("pk_cols"),
             field_name="pk_cols",
@@ -1341,53 +1459,114 @@ def _build_specs_from_config(
             raw_fks = [raw_fks]
 
         if not isinstance(raw_fks, (list, tuple)):
-            raise TypeError(
-                f"Tabela `{name}`: `foreign_keys` deve ser lista/tupla de dicts."
+            _warn_or_raise(
+                f"Tabela `{name}`: `foreign_keys` deveria ser lista/tupla de dicts, "
+                f"mas veio {type(raw_fks).__name__}. Todas as FKs dessa tabela serão ignoradas.",
+                policy=relationship_policy,
             )
+            raw_fks = []
 
         fks: List[ForeignKeySpec] = []
 
         for i, fk in enumerate(raw_fks):
             if isinstance(fk, ForeignKeySpec):
+                # Se vier objeto pronto e completo, mantém. Se estiver incompleto, saneamento posterior trata.
                 fks.append(fk)
                 continue
 
             if not isinstance(fk, ABCMapping):
-                raise ValueError(
-                    f"Tabela `{name}`: FK #{i} deve ser um dict com "
-                    "`columns`, `parent_table`, `parent_columns`. "
-                    f"Recebido: {fk!r}"
+                _warn_or_raise(
+                    f"Relacionamento ignorado em `{name}` FK #{i}: esperado dict, recebido {fk!r}.",
+                    policy=relationship_policy,
                 )
+                continue
 
-            if "columns" not in fk:
-                raise ValueError(f"Tabela `{name}`: FK #{i} sem chave `columns`.")
-
-            if "parent_table" not in fk:
-                raise ValueError(f"Tabela `{name}`: FK #{i} sem chave `parent_table`.")
-
-            if "parent_columns" not in fk:
-                raise ValueError(f"Tabela `{name}`: FK #{i} sem chave `parent_columns`.")
-
-            cols = _normalize_cols(
+            # columns continua necessário para saber qual coluna da filha participaria da FK.
+            cols = _try_normalize_cols(
                 fk.get("columns"),
                 field_name="foreign_keys.columns",
                 table_name=name,
+                fk_index=i,
             )
-            parent_cols = _normalize_cols(
+            if not cols:
+                _warn_or_raise(
+                    f"Relacionamento ignorado em `{name}` FK #{i}: `columns` não foi informado. "
+                    "A tabela será sintetizada sem essa FK.",
+                    policy=relationship_policy,
+                )
+                continue
+
+            raw_parent_table = fk.get("parent_table")
+            parent_table = str(raw_parent_table).strip() if raw_parent_table is not None else ""
+
+            parent_cols = _try_normalize_cols(
                 fk.get("parent_columns"),
                 field_name="foreign_keys.parent_columns",
                 table_name=name,
-            )
-            parent_table = str(fk.get("parent_table", "")).strip()
+                fk_index=i,
+            ) if fk.get("parent_columns") is not None else None
 
+            # Se parent_columns não foi informado, mas parent_table existe, usa pk_cols do pai.
+            if parent_cols is None and parent_table:
+                parent_cfg = specs_config.get(parent_table)
+                if isinstance(parent_cfg, ABCMapping) and parent_cfg.get("pk_cols") is not None:
+                    parent_cols = _normalize_cols(
+                        parent_cfg.get("pk_cols"),
+                        field_name="pk_cols",
+                        table_name=parent_table,
+                    )
+                    warnings.warn(
+                        f"Relacionamento `{name}` FK #{i}: `parent_columns` não informado. "
+                        f"Usando pk_cols da tabela pai `{parent_table}`: {list(parent_cols)}.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                else:
+                    _warn_or_raise(
+                        f"Relacionamento ignorado em `{name}` FK #{i}: `parent_columns` ausente "
+                        f"e não foi possível obter pk_cols do parent_table `{parent_table}`.",
+                        policy=relationship_policy,
+                    )
+                    continue
+
+            # Se parent_table não foi informado, tenta inferir por parent_columns ou columns.
             if not parent_table:
-                raise ValueError(f"Tabela `{name}`: FK #{i} tem `parent_table` vazio.")
+                inferred_parent, inferred_parent_cols, reason = _infer_parent_table_from_config(
+                    specs_config,
+                    child_table=name,
+                    parent_columns=parent_cols,
+                    child_fk_columns=cols,
+                )
+
+                if inferred_parent and inferred_parent_cols:
+                    parent_table = inferred_parent
+                    parent_cols = inferred_parent_cols
+                    warnings.warn(
+                        f"Relacionamento `{name}` FK #{i}: `parent_table` não informado. {reason}.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                else:
+                    _warn_or_raise(
+                        f"Relacionamento ignorado em `{name}` FK #{i}: {reason}. "
+                        "A tabela será sintetizada sem essa FK.",
+                        policy=relationship_policy,
+                    )
+                    continue
+
+            if parent_cols is None:
+                _warn_or_raise(
+                    f"Relacionamento ignorado em `{name}` FK #{i}: `parent_columns` não informado "
+                    "e não foi possível inferir. A tabela será sintetizada sem essa FK.",
+                    policy=relationship_policy,
+                )
+                continue
 
             fks.append(
                 ForeignKeySpec(
-                    columns=cols,
+                    columns=tuple(cols),
                     parent_table=parent_table,
-                    parent_columns=parent_cols,
+                    parent_columns=tuple(parent_cols),
                 )
             )
 
@@ -1406,8 +1585,14 @@ def _build_specs_from_config(
 def build_specs_from_config(
     specs_config: Mapping[str, Mapping],
     postprocess_by_table: Optional[Mapping[str, PostProcessor]] = None,
+    *,
+    relationship_policy: RelationshipPolicy = "warn_and_skip",
 ) -> Dict[str, TableSpec]:
-    return _build_specs_from_config(specs_config, postprocess_by_table)
+    return _build_specs_from_config(
+        specs_config,
+        postprocess_by_table,
+        relationship_policy=relationship_policy,
+    )
 
 
 def _preflight_relationships(
@@ -1519,7 +1704,11 @@ def run_synthesis_from_tables(
     """
     Runner para quando os DataFrames já estão carregados.
     """
-    specs = _build_specs_from_config(specs_config, postprocess_by_table)
+    specs = _build_specs_from_config(
+        specs_config,
+        postprocess_by_table,
+        relationship_policy=relationship_policy,
+    )
 
     specs = _sanitize_specs_against_known_tables(
         specs,
@@ -1597,7 +1786,11 @@ def run_synthesis_from_paths(
     Se algum relacionamento declarado não existir, ele gera warning e segue.
     """
     # 1) dict -> specs tipadas
-    specs = _build_specs_from_config(specs_config, postprocess_by_table)
+    specs = _build_specs_from_config(
+        specs_config,
+        postprocess_by_table,
+        relationship_policy=relationship_policy,
+    )
 
     # 2) pré-checagem de relacionamentos por nome de tabela
     specs = _preflight_relationships(

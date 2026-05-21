@@ -1,0 +1,12 @@
+# CSV data files
+*.csv
+data_csv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+.ipynb_checkpoints/
+
+# pip
+pip/

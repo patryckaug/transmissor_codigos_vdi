@@ -6,6 +6,13 @@ from synthetic_multitable_spark_v3 import (
     build_specs_for_base,      # (apenas se quiser as specs prontas da base CDB)
 )
 
+
+table_paths = {
+    "tipo_if": "/caminho/tipo_if",
+    "instrumento": "/caminho/instrumento",
+    "operacao": "/caminho/operacao",
+}
+
 from pyspark import StorageLevel
 
 synthetic = run_synthesis_from_paths(

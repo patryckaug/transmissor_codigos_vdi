@@ -532,12 +532,37 @@ def _referenced_parent_columns(specs: Mapping[str, TableSpec]) -> Dict[str, set]
 # ============================================================
 
 def _with_contiguous_row_id(df: DataFrame, id_col: str) -> DataFrame:
-    spark = df.sparkSession
-    schema_with_id = T.StructType(
-        df.schema.fields + [T.StructField(id_col, T.LongType(), False)]
+    """
+    Adiciona um identificador contíguo 0..N-1 sem usar RDD/lambda.
+
+    Motivo:
+        Algumas combinações de PySpark + Python geram erro em cloudpickle.dumps
+        quando usamos df.rdd.zipWithIndex().map(lambda ...), por exemplo:
+
+            IndexError: tuple index out of range
+            Could not serialize object
+
+        Esta implementação usa apenas expressões Spark SQL/DataFrame, evitando
+        serialização de função Python para os executores.
+
+    Observação:
+        Window.orderBy(...) cria uma ordenação global. É mais segura para
+        compatibilidade do que a versão RDD, embora possa ser mais custosa em
+        tabelas muito grandes.
+    """
+    ordering_col = f"__{id_col}_order_tmp"
+
+    while ordering_col in df.columns:
+        ordering_col = f"_{ordering_col}"
+
+    w = Window.orderBy(F.col(ordering_col))
+
+    return (
+        df
+        .withColumn(ordering_col, F.monotonically_increasing_id())
+        .withColumn(id_col, (F.row_number().over(w) - F.lit(1)).cast("long"))
+        .drop(ordering_col)
     )
-    indexed_rdd = df.rdd.zipWithIndex().map(lambda r: tuple(r[0]) + (r[1],))
-    return spark.createDataFrame(indexed_rdd, schema=schema_with_id)
 
 
 def _bootstrap_rows_exact(
@@ -555,14 +580,13 @@ def _bootstrap_rows_exact(
     src_cols = [c for c in src_indexed.columns if c != "__src_row_id"]
 
     if n_rows == 0:
-        empty_schema = T.StructType(
-            [
-                T.StructField("__synthetic_pos", T.LongType(), False),
-                T.StructField("__orig_src_row_id", T.LongType(), True),
-            ]
-            + [f for f in src_indexed.schema.fields if f.name in src_cols]
+        # Evita spark.createDataFrame([], schema=...), que pode acionar
+        # cloudpickle em algumas versões do PySpark/Python.
+        return src_indexed.limit(0).select(
+            F.lit(None).cast("long").alias("__synthetic_pos"),
+            F.lit(None).cast("long").alias("__orig_src_row_id"),
+            *[F.col(c) for c in src_cols],
         )
-        return spark.createDataFrame([], schema=empty_schema)
 
     if src_count == 0:
         raise ValueError("Fonte vazia mas n_rows > 0.")
@@ -873,6 +897,56 @@ def _apply_fk_mapping(
 # 7. Validações de resultado
 # ============================================================
 
+def _rows_to_spark_df(
+    spark: SparkSession,
+    rows: List[Tuple[Any, ...]],
+    columns: List[Tuple[str, str]],
+) -> DataFrame:
+    """
+    Cria um DataFrame pequeno de diagnóstico sem spark.createDataFrame(rows).
+
+    Motivo:
+        Em alguns ambientes, spark.createDataFrame(lista_python) pode acionar
+        cloudpickle.dumps e falhar com:
+
+            IndexError: tuple index out of range
+            Could not serialize object
+
+        Para evitar isso, montamos cada linha usando spark.range(1).select(lit(...)).
+        Assim não serializamos função Python nem lista de Row para os executores.
+
+    Args:
+        spark: SparkSession.
+        rows: lista de tuplas com os valores.
+        columns: lista de pares (nome_coluna, tipo_spark_sql), ex.:
+                 [("table", "string"), ("total_rows", "long")].
+    """
+    select_exprs_empty = [
+        F.lit(None).cast(dtype).alias(name)
+        for name, dtype in columns
+    ]
+
+    if not rows:
+        return spark.range(0).select(*select_exprs_empty)
+
+    df_out: Optional[DataFrame] = None
+
+    for row in rows:
+        if len(row) != len(columns):
+            raise ValueError(
+                f"Linha de diagnóstico possui {len(row)} valores, mas eram esperados "
+                f"{len(columns)}: {row!r}"
+            )
+
+        exprs = [
+            F.lit(value).cast(dtype).alias(name)
+            for value, (name, dtype) in zip(row, columns)
+        ]
+        one = spark.range(1).select(*exprs)
+        df_out = one if df_out is None else df_out.unionByName(one)
+
+    return df_out
+
 def validate_primary_keys(
     tables: Mapping[str, DataFrame],
     specs: Mapping[str, TableSpec],
@@ -902,11 +976,18 @@ def validate_primary_keys(
             )
         )
 
-    schema = (
-        "table string, pk_cols string, total_rows long, distinct_pk long, "
-        "null_pk_rows long, duplicate_pk_rows long"
+    return _rows_to_spark_df(
+        spark,
+        rows,
+        columns=[
+            ("table", "string"),
+            ("pk_cols", "string"),
+            ("total_rows", "long"),
+            ("distinct_pk", "long"),
+            ("null_pk_rows", "long"),
+            ("duplicate_pk_rows", "long"),
+        ],
     )
-    return spark.createDataFrame(rows, schema=schema)
 
 
 def _filter_child_fk_for_validation(
@@ -1009,11 +1090,18 @@ def validate_foreign_keys(
                 )
             )
 
-    schema = (
-        "child_table string, fk_cols string, parent_table string, parent_cols string, "
-        "distinct_child_fk long, invalid_fk long"
+    return _rows_to_spark_df(
+        spark,
+        rows,
+        columns=[
+            ("child_table", "string"),
+            ("fk_cols", "string"),
+            ("parent_table", "string"),
+            ("parent_cols", "string"),
+            ("distinct_child_fk", "long"),
+            ("invalid_fk", "long"),
+        ],
     )
-    return spark.createDataFrame(rows, schema=schema)
 
 
 def _run_validation_or_raise(

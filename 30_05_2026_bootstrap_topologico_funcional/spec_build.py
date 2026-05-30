@@ -655,12 +655,19 @@ def build_validated_specs_config(
             UserWarning,
         )
 
-    scope = list(name_map.keys())  # nomes (do metadado) que existem nos dois lados
-    if not scope:
+    if not name_map:
         raise ValueError("Nenhuma tabela em comum entre o metadado e `tables`.")
 
+    # Daqui para frente usamos SEMPRE o nome canônico = a chave real de `tables`.
+    # Isso garante que as chaves de specs_config (e os parent_table das FKs) casem
+    # exatamente com `tables`, que é o que o sintetizador exige (case-sensitive).
+    cand_by_real: Dict[str, Dict[str, Any]] = {
+        name_map[meta_name]: candidates[meta_name] for meta_name in name_map
+    }
+    scope = list(cand_by_real.keys())  # nomes canônicos (chaves reais de tables)
+
     # ---- "show" das tabelas em escopo
-    scoped_tables = {meta_name: tables[name_map[meta_name]] for meta_name in scope}
+    scoped_tables = {real: tables[real] for real in scope}
     if show_samples:
         inspect_tables(scoped_tables, show_n=show_n, do_show=True)
 
@@ -668,7 +675,7 @@ def build_validated_specs_config(
     validated_pk: Dict[str, List[str]] = {}
     for meta_name in scope:
         df = scoped_tables[meta_name]
-        pk_cols = [c for c in candidates[meta_name]["pk_cols"] if c]
+        pk_cols = [c for c in cand_by_real[meta_name]["pk_cols"] if c]
 
         if not pk_cols and infer_missing_pk:
             inferred = _infer_pk_candidates(df)
@@ -743,7 +750,7 @@ def build_validated_specs_config(
     for child in valid_tables:
         df = scoped_tables[child]
         child_dtypes = dict(df.dtypes)
-        for fk in candidates[child]["_fk_candidates"]:
+        for fk in cand_by_real[child]["_fk_candidates"]:
             child_cols = [c for c in fk["columns"] if c in df.columns]
             if not child_cols:
                 skipped.append({"type": "fk", "child_table": child,

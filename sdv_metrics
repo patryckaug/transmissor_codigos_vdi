@@ -39,6 +39,7 @@ from __future__ import annotations
 import glob
 import os
 import warnings as _warnings
+_warnings.filterwarnings("ignore", category=FutureWarning, module=r"pandas.*")
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
@@ -55,32 +56,49 @@ _RED   = "#B91C1C"
 _ICE   = "#CADCFC"
 _LIGHT = "#F0F4FF"
 
-# ── Filtros de warning que o SDMetrics emite internamente ────
-_W_FILTERS = [
-    ("ignore", "An input array is constant",  RuntimeWarning, ""),
-    ("ignore", "divide by zero",              RuntimeWarning, ""),
-    ("ignore", "invalid value encountered",   RuntimeWarning, ""),
-    ("ignore", "Mean of empty slice",         RuntimeWarning, ""),
-    ("ignore", "Degrees of freedom",          RuntimeWarning, ""),
-    ("ignore", "covariance",                  RuntimeWarning, ""),
-    ("ignore", "",                            UserWarning,    "sdmetrics"),
-]
-
-
 def _silence():
-    """Context manager que suprime os warnings ruidosos do SDMetrics."""
+    """
+    Context manager que suprime TODOS os warnings ruidosos gerados pelo
+    SDMetrics e suas dependências (scipy, numpy):
+
+    • ConstantInputWarning / NearConstantInputWarning (scipy.stats):
+        aparece quando uma coluna tem valor constante ou quase constante —
+        situação comum em dados sintéticos de colunas de flag/status.
+    • SDMetricsWarning / ConstantInputWarning (sdmetrics.warnings):
+        versão interna do sdmetrics do mesmo problema.
+    • RuntimeWarning numpy:
+        divide-by-zero e invalid-value gerados internamente.
+    • UserWarning de sdmetrics:
+        avisos de merge e compatibilidade internos da lib.
+    """
     import contextlib
 
     @contextlib.contextmanager
     def _ctx():
         with _warnings.catch_warnings():
-            for action, msg, cat, mod in _W_FILTERS:
-                kw: dict = {"action": action, "category": cat}
-                if msg:
-                    kw["message"] = msg
-                if mod:
-                    kw["module"] = mod
-                _warnings.filterwarnings(**kw)
+            # Silenciar TUDO de sdmetrics e suas dependências
+            _warnings.filterwarnings("ignore", module=r"sdmetrics.*")
+            _warnings.filterwarnings("ignore", module=r"scipy.*")
+            # RuntimeWarning do numpy (divide by zero, invalid value, etc.)
+            _warnings.filterwarnings("ignore", category=RuntimeWarning)
+            # UserWarning de qualquer origem durante o cálculo
+            _warnings.filterwarnings("ignore", category=UserWarning)
+            # ConstantInputWarning do scipy (subclasse de RuntimeWarning
+            # mas com nome próprio — garantir que pega)
+            try:
+                from scipy.stats import ConstantInputWarning
+                _warnings.filterwarnings("ignore", category=ConstantInputWarning)
+            except ImportError:
+                pass
+            # SDMetricsWarning e ConstantInputWarning do próprio sdmetrics
+            try:
+                from sdmetrics.warnings import SDMetricsWarning, ConstantInputWarning as _CIW
+                _warnings.filterwarnings("ignore", category=SDMetricsWarning)
+                _warnings.filterwarnings("ignore", category=_CIW)
+            except ImportError:
+                pass
+            _warnings.filterwarnings("ignore", category=FutureWarning)
+            _warnings.filterwarnings("ignore", category=DeprecationWarning)
             yield
 
     return _ctx()
@@ -182,12 +200,20 @@ def _load_all(
 # ============================================================
 
 def _align_tables(
-    real: Dict[str, pd.DataFrame],
+    real:  Dict[str, pd.DataFrame],
     synth: Dict[str, pd.DataFrame],
 ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]:
     """
     Garante mesmas colunas e dtypes entre real e sintético.
-    Colunas exclusivas de um lado são descartadas com aviso.
+
+    Estratégia de coerção por coluna:
+        1. Se os dtypes já são iguais, não faz nada.
+        2. Tenta converter o sintético para o dtype do real.
+        3. Se falhar, converte ambos para string.
+
+    Isso evita o ValueError do SDMetrics ao fazer joins internos de
+    relacionamento quando a mesma coluna de chave tem dtype diferente
+    entre tabela filha e tabela pai (ex.: string vs int64).
     """
     common = sorted(set(real) & set(synth))
     real_out, synth_out = {}, {}
@@ -198,13 +224,24 @@ def _align_tables(
         r, s = r[cols], s[cols]
 
         for c in cols:
-            if r[c].dtype == s[c].dtype:
+            if str(r[c].dtype) == str(s[c].dtype):
                 continue
+            # Tentar numérico primeiro (preserva precisão de IDs)
             try:
-                s[c] = s[c].astype(r[c].dtype)
+                r_num = pd.to_numeric(r[c], errors="raise")
+                s_num = pd.to_numeric(s[c], errors="raise")
+                # Normalizar para o mesmo tipo numérico
+                target = (
+                    "float64"
+                    if "float" in str(r_num.dtype) or "float" in str(s_num.dtype)
+                    else "int64"
+                )
+                r[c] = r_num.astype(target)
+                s[c] = s_num.astype(target)
             except (ValueError, TypeError):
-                r[c] = r[c].astype("string")
-                s[c] = s[c].astype("string")
+                # Fallback: ambos como string
+                r[c] = r[c].astype(str).replace("nan", pd.NA).astype("string")
+                s[c] = s[c].astype(str).replace("nan", pd.NA).astype("string")
 
         real_out[t], synth_out[t] = r, s
 
@@ -502,9 +539,9 @@ def _style_df(
         return f"background-color:{c};color:white;font-weight:bold"
 
     if score_col and score_col in df.columns:
-        styler = styler.applymap(_bg_score, subset=[score_col])
+        styler = styler.map(_bg_score, subset=[score_col])
     if status_col and status_col in df.columns:
-        styler = styler.applymap(_bg_status, subset=[status_col])
+        styler = styler.map(_bg_status, subset=[status_col])
 
     return styler
 

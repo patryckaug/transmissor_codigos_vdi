@@ -1,0 +1,19 @@
+# 1) Instalar (uma vez)
+!pip install sdmetrics
+
+# 2) Rodar a comparação
+from sdv_compare_report import run_comparison_report
+
+resultado = run_comparison_report(
+    original_table_paths=table_paths,   # o MESMO dict da síntese
+    synthetic_path="./csv",             # o MESMO save_path da síntese
+    specs_config=specs_config,          # o MESMO specs_config (PKs e FKs)
+    original_format="csv",
+    synthetic_format="csv",             # = save_format usado ao salvar
+    output_html="relatorio_engordai.html",
+    # max_rows=50_000,                  # descomente p/ tabelas grandes
+)
+
+# 3) Ver o painel direto no Jupyter (opcional)
+from IPython.display import IFrame
+IFrame("relatorio_engordai.html", width="100%", height=700)

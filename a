@@ -1,0 +1,20 @@
+from pyspark.sql import SparkSession
+
+spark = (
+    SparkSession.builder
+    .appName("read-oci-parquet")
+    .config("spark.jars.packages", "com.oracle.oci.sdk:oci-hdfs-connector:3.50.2")
+    .config("spark.hadoop.fs.oci.impl", "com.oracle.bmc.hdfs.BmcFilesystem")
+    .getOrCreate()
+)
+
+from pyspark.sql import SparkSession
+
+spark = (
+    SparkSession.builder
+    .appName("read-oci-parquet")
+    .config("spark.jars.packages", "com.oracle.oci.sdk:oci-hdfs-full:3.50.2")
+    .getOrCreate()
+)
+
+path = "oci://oci-st-blc-engordai-qab-nqgr97zoyfhcmu@your_namespace/onprem-export//"

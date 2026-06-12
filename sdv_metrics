@@ -3,59 +3,42 @@
 sdv_compare_report.py
 =====================
 
-Compara DADOS SINTÉTICOS (salvos pelo synthetic_multitable_spark via
-save_path/<TABELA>/) com os DADOS ORIGINAIS, usando as métricas oficiais do
-ecossistema SDV (biblioteca `sdmetrics`), e gera um PAINEL HTML simples de
-ler, além de um resumo no console.
+Compara DADOS SINTÉTICOS com DADOS ORIGINAIS usando métricas do SDMetrics
+(ecossistema SDV) e exibe tudo INLINE no Jupyter Notebook — sem arquivo
+externo.
 
-O que é medido
---------------
-1. DIAGNÓSTICO (DiagnosticReport multi-tabela do SDMetrics):
-     - Data Validity .......... valores válidos por coluna (faixas, tipos,
-                                 PKs únicas e não nulas);
-     - Data Structure ......... mesmas colunas/estrutura do original;
-     - Relationship Validity .. INTEGRIDADE REFERENCIAL: cada FK sintética
-                                 aponta para uma PK existente no pai sintético.
-   Esperado: ~100%. Abaixo disso há problema de integridade.
-
-2. QUALIDADE ESTATÍSTICA (QualityReport multi-tabela do SDMetrics):
-     - Column Shapes .......... fidelidade da DISTRIBUIÇÃO de cada coluna
-                                 (KS para numéricas, TV para categóricas);
-     - Column Pair Trends ..... preservação de CORRELAÇÕES entre pares de
-                                 colunas dentro de cada tabela;
-     - Cardinality ............ distribuição de filhos-por-pai (fan-out)
-                                 entre tabelas relacionadas.
-   1.0 = distribuições idênticas; 0.0 = completamente diferentes.
-
-3. INTEGRIDADE DIRETA (checagem independente, em pandas):
-     - PK: total de linhas, PKs distintas, nulas e duplicadas;
-     - FK: % de chaves válidas contra o pai sintético (nulos excluídos).
-   Redundância proposital com o item 1: dois caminhos de cálculo chegando
-   ao mesmo resultado dão confiança na auditoria.
-
-Uso no notebook
----------------
+Uso
+---
     from sdv_compare_report import run_comparison_report
 
     resultado = run_comparison_report(
-        original_table_paths=table_paths,    # MESMO dict usado na síntese
-        synthetic_path="./csv",              # MESMO save_path usado na síntese
-        specs_config=specs_config,           # MESMO specs_config da síntese
-        original_format="csv",
-        synthetic_format="csv",              # mesmo save_format da síntese
-        output_html="relatorio_engordai.html",
+        original_table_paths = table_paths,   # mesmo dict da síntese
+        synthetic_path       = "./csv",        # mesmo save_path da síntese
+        specs_config         = specs_config,   # mesmo specs_config da síntese
+        original_format      = "csv",
+        synthetic_format     = "csv",          # mesmo save_format usado
     )
 
-Dependências: pip install sdmetrics pandas (pyarrow para parquet).
+O que é exibido inline
+-----------------------
+1. Scorecard visual (barras coloridas) — Diagnóstico + Qualidade
+2. Volumes por tabela (original vs sintético, fator multiplicador)
+3. Diagnóstico SDMetrics — Data Validity / Structure / Relationship Validity
+4. Qualidade SDMetrics   — Column Shapes / Pair Trends / Cardinality
+5. Top-10 colunas com menor fidelidade de distribuição
+6. Integridade direta — Primary Keys (PK única, não-nula, sem duplicata)
+7. Integridade direta — Foreign Keys (% válidas contra o pai sintético)
+8. Gráficos de distribuição Original vs Sintético por tabela
+9. Resumo de uma linha no final
+
+Dependências: pip install sdmetrics matplotlib seaborn
 """
 
 from __future__ import annotations
 
 import glob
-import html
 import os
-import warnings
-from datetime import datetime
+import warnings as _warnings
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
@@ -63,41 +46,63 @@ import pandas as pd
 
 from sdmetrics.reports.multi_table import DiagnosticReport, QualityReport
 
-# Paleta GB
-NAVY = "#1E2761"
-TEAL = "#0F766E"
-TEAL_BRIGHT = "#2DD4BF"
-ICE = "#CADCFC"
-LIGHT = "#F5F8FC"
-RED = "#B91C1C"
-AMBER = "#B45309"
+# ── Paleta GB ────────────────────────────────────────────────
+_NAVY  = "#1E2761"
+_TEAL  = "#0F766E"
+_GREEN = "#15803D"
+_AMBER = "#B45309"
+_RED   = "#B91C1C"
+_ICE   = "#CADCFC"
+_LIGHT = "#F0F4FF"
+
+# ── Filtros de warning que o SDMetrics emite internamente ────
+_W_FILTERS = [
+    ("ignore", "An input array is constant",  RuntimeWarning, ""),
+    ("ignore", "divide by zero",              RuntimeWarning, ""),
+    ("ignore", "invalid value encountered",   RuntimeWarning, ""),
+    ("ignore", "Mean of empty slice",         RuntimeWarning, ""),
+    ("ignore", "Degrees of freedom",          RuntimeWarning, ""),
+    ("ignore", "covariance",                  RuntimeWarning, ""),
+    ("ignore", "",                            UserWarning,    "sdmetrics"),
+]
+
+
+def _silence():
+    """Context manager que suprime os warnings ruidosos do SDMetrics."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def _ctx():
+        with _warnings.catch_warnings():
+            for action, msg, cat, mod in _W_FILTERS:
+                kw: dict = {"action": action, "category": cat}
+                if msg:
+                    kw["message"] = msg
+                if mod:
+                    kw["module"] = mod
+                _warnings.filterwarnings(**kw)
+            yield
+
+    return _ctx()
 
 
 # ============================================================
-# 1. Leitura de tabelas (arquivo único OU pasta com part-files)
+# 1. Leitura de tabelas — robusta contra CSV malformado
 # ============================================================
 
 def _read_csv_robust(filepath: str) -> pd.DataFrame:
     """
-    Lê UM arquivo CSV com fallback automático para os problemas mais comuns
-    nos CSVs do Spark/Oracle/B3:
+    Lê um CSV com fallback automático para os problemas comuns nos arquivos
+    do Spark / Oracle / B3:
 
-        ParseError: Expected N fields, saw M
-            -> vírgula dentro de um campo sem aspas (comum em descrições
-               e nomes de empresas do CDB).
+    • ParseError "Expected N fields, saw M"
+        vírgula dentro de campo sem aspas (nomes de empresas, descrições).
+    • UnicodeDecodeError
+        encoding latin-1 / cp1252 em vez de UTF-8.
+    • Separador ";" em vez de ","
+        CSV gerado por ferramentas BR / Excel.
 
-        UnicodeDecodeError
-            -> encoding latin-1 / cp1252 no lugar de UTF-8.
-
-        Separador errado
-            -> arquivo gerado com ";" em vez de ",".
-
-    Ordem de tentativas (para na primeira que funcionar):
-        1. C engine, utf-8-sig, sep=","      <- mais rápido, tenta primeiro
-        2. C engine, latin-1,   sep=","
-        3. Python engine, utf-8-sig, sep=","  <- mais tolerante a má formação
-        4. Python engine, latin-1,   sep=","
-        5. Python engine, latin-1,   sep=";"  <- separador alternativo
+    Tenta 5 combinações em cascata; para na primeira que funcionar.
     """
     attempts = [
         dict(engine="c",      encoding="utf-8-sig", sep=","),
@@ -107,21 +112,18 @@ def _read_csv_robust(filepath: str) -> pd.DataFrame:
         dict(engine="python", encoding="latin-1",   sep=";"),
     ]
     last_exc: Exception = RuntimeError("falha desconhecida")
+
     for kw in attempts:
         try:
-            df = pd.read_csv(
-                filepath,
-                on_bad_lines="warn",   # pula linhas corrompidas com aviso
-                **kw,
-            )
-            # Sanidade: se resultou em 1 coluna mas sep=",", provavelmente
-            # o separador real é ";" — descarta e tenta o próximo.
+            df = pd.read_csv(filepath, on_bad_lines="warn", **kw)
+            # se resultou em 1 coluna com sep=",", provavelmente o sep real é ";"
             if len(df.columns) == 1 and kw["sep"] == ",":
                 last_exc = ValueError("1 coluna com sep=','; tentando ';'")
                 continue
             return df
         except Exception as exc:
             last_exc = exc
+
     raise RuntimeError(
         f"Não foi possível ler '{filepath}' após todas as tentativas.\n"
         f"Último erro: {last_exc}"
@@ -130,25 +132,18 @@ def _read_csv_robust(filepath: str) -> pd.DataFrame:
 
 def _load_table(path: str, fmt: str) -> pd.DataFrame:
     """
-    Lê uma tabela de um arquivo único ou de uma PASTA gerada pelo Spark
-    (part-00000-*.csv / *.parquet + _SUCCESS), formato em que o
-    sintetizador salva cada tabela em save_path/<TABELA>/.
-
-    Para CSV usa _read_csv_robust: suporta campos com vírgula sem aspas,
-    encodings latin-1/UTF-8 e separadores alternativos — não quebra mesmo
-    com CSVs gerados por ferramentas diversas do B3/CDB.
+    Lê arquivo único OU pasta de part-files do Spark
+    (save_path/<TABELA>/part-*.csv ou *.parquet).
     """
-    fmt = (fmt or "csv").lower()
+    fmt  = (fmt or "csv").lower()
     path = os.path.expanduser(str(path).rstrip("/"))
 
     if not os.path.exists(path):
         raise FileNotFoundError(f"Caminho não encontrado: {path}")
 
-    # ---- PARQUET ----
     if fmt == "parquet":
-        return pd.read_parquet(path)   # pyarrow lê arquivo ou pasta
+        return pd.read_parquet(path)
 
-    # ---- CSV: pasta com part-files do Spark ----
     if os.path.isdir(path):
         partes = sorted(glob.glob(os.path.join(path, "*.csv")))
         if not partes:
@@ -157,14 +152,10 @@ def _load_table(path: str, fmt: str) -> pd.DataFrame:
             raise FileNotFoundError(
                 f"Nenhum arquivo CSV em: {path}\n"
                 "Verifique se save_format='csv' foi usado na síntese, "
-                "ou use synthetic_format='parquet' para evitar o problema."
+                "ou use synthetic_format='parquet'."
             )
-        return pd.concat(
-            (_read_csv_robust(p) for p in partes),
-            ignore_index=True,
-        )
+        return pd.concat((_read_csv_robust(p) for p in partes), ignore_index=True)
 
-    # ---- CSV: arquivo único ----
     return _read_csv_robust(path)
 
 
@@ -179,21 +170,15 @@ def _load_all(
     out: Dict[str, pd.DataFrame] = {}
     for name, p in paths.items():
         df = _load_table(p, fmt)
-        if max_rows is not None and len(df) > max_rows:
+        if max_rows and len(df) > max_rows:
             df = df.sample(n=max_rows, random_state=seed).reset_index(drop=True)
-            warnings.warn(
-                f"{label} `{name}` amostrada para {max_rows} linhas "
-                "(max_rows) para acelerar as métricas.",
-                UserWarning,
-                stacklevel=2,
-            )
         out[name] = df
-        print(f"  [{label}] {name}: {len(df)} linhas x {len(df.columns)} colunas")
+        print(f"  [{label}] {name}: {len(df):,} linhas × {len(df.columns)} colunas")
     return out
 
 
 # ============================================================
-# 2. Alinhamento de schemas (real x sintético)
+# 2. Alinhamento de schemas
 # ============================================================
 
 def _align_tables(
@@ -201,34 +186,15 @@ def _align_tables(
     synth: Dict[str, pd.DataFrame],
 ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]:
     """
-    Garante mesmas colunas e dtypes compatíveis entre real e sintético
-    (o SDMetrics exige estrutura idêntica). Colunas exclusivas de um lado
-    são descartadas com warning; o dtype do sintético é coagido ao do real
-    quando possível.
+    Garante mesmas colunas e dtypes entre real e sintético.
+    Colunas exclusivas de um lado são descartadas com aviso.
     """
-    common_tables = sorted(set(real) & set(synth))
-    faltando = sorted((set(real) | set(synth)) - set(common_tables))
-    if faltando:
-        warnings.warn(
-            f"Tabelas presentes em apenas um dos lados, ignoradas: {faltando}",
-            UserWarning,
-            stacklevel=2,
-        )
-
+    common = sorted(set(real) & set(synth))
     real_out, synth_out = {}, {}
 
-    for t in common_tables:
+    for t in common:
         r, s = real[t].copy(), synth[t].copy()
-
         cols = [c for c in r.columns if c in set(s.columns)]
-        dropped = sorted(set(r.columns).symmetric_difference(s.columns))
-        if dropped:
-            warnings.warn(
-                f"Tabela `{t}`: colunas sem par ignoradas: {dropped}",
-                UserWarning,
-                stacklevel=2,
-            )
-
         r, s = r[cols], s[cols]
 
         for c in cols:
@@ -237,8 +203,6 @@ def _align_tables(
             try:
                 s[c] = s[c].astype(r[c].dtype)
             except (ValueError, TypeError):
-                # Último recurso: ambos como string (mantém comparabilidade
-                # categórica sem quebrar o relatório).
                 r[c] = r[c].astype("string")
                 s[c] = s[c].astype("string")
 
@@ -248,7 +212,7 @@ def _align_tables(
 
 
 # ============================================================
-# 3. Metadata SDMetrics a partir do specs_config
+# 3. Metadata para SDMetrics
 # ============================================================
 
 def _normalize_cols_cfg(v: Any) -> List[str]:
@@ -276,26 +240,22 @@ def build_sdmetrics_metadata(
     specs_config: Mapping[str, Mapping],
 ) -> Dict[str, Any]:
     """
-    Converte o MESMO specs_config usado na síntese (pk_cols + foreign_keys)
-    no dicionário de metadata multi-tabela que o SDMetrics espera.
-
-    Limitação do SDMetrics: relacionamentos com chave COMPOSTA não são
-    suportados no metadata — esses são pulados aqui (com warning), mas a
-    checagem de integridade DIRETA deste módulo cobre compostas também.
+    Converte specs_config no formato de metadata multi-tabela do SDMetrics.
+    FKs compostas são ignoradas aqui (cobertas pela checagem direta).
     """
     meta: Dict[str, Any] = {"tables": {}, "relationships": []}
-
     key_cols: Dict[str, set] = {}
+
     for t, cfg in specs_config.items():
-        pks = _normalize_cols_cfg(cfg.get("pk_cols"))
-        fks = set()
+        pks = set(_normalize_cols_cfg(cfg.get("pk_cols")))
+        fks: set = set()
         for fk in (cfg.get("foreign_keys") or cfg.get("fks") or []):
             fks.update(_normalize_cols_cfg(fk.get("columns")))
-        key_cols[t] = set(pks) | fks
+        key_cols[t] = pks | fks
 
     for t, df in real.items():
-        cfg = specs_config.get(t, {})
-        pks = _normalize_cols_cfg(cfg.get("pk_cols"))
+        cfg  = specs_config.get(t, {})
+        pks  = _normalize_cols_cfg(cfg.get("pk_cols"))
         cols = {
             c: _sdtype_of(df[c], c in key_cols.get(t, set()))
             for c in df.columns
@@ -309,130 +269,50 @@ def build_sdmetrics_metadata(
         if t not in real:
             continue
         for fk in (cfg.get("foreign_keys") or cfg.get("fks") or []):
-            cols = _normalize_cols_cfg(fk.get("columns"))
+            cols  = _normalize_cols_cfg(fk.get("columns"))
             pcols = _normalize_cols_cfg(fk.get("parent_columns"))
-            ptab = fk.get("parent_table")
+            ptab  = fk.get("parent_table")
             if not ptab or ptab not in real:
                 continue
             if len(cols) != 1 or len(pcols) != 1:
-                warnings.warn(
-                    f"FK composta {t}.{cols} -> {ptab}.{pcols} não suportada "
-                    "no metadata do SDMetrics; coberta apenas pela checagem "
-                    "direta de integridade.",
-                    UserWarning,
-                    stacklevel=2,
-                )
                 continue
-            meta["relationships"].append(
-                {
-                    "parent_table_name": ptab,
-                    "parent_primary_key": pcols[0],
-                    "child_table_name": t,
-                    "child_foreign_key": cols[0],
-                }
-            )
+            meta["relationships"].append({
+                "parent_table_name":  ptab,
+                "parent_primary_key": pcols[0],
+                "child_table_name":   t,
+                "child_foreign_key":  cols[0],
+            })
 
     return meta
 
 
 # ============================================================
-# 4. Integridade direta (independente do SDMetrics)
+# 4. Integridade direta (PK + FK em pandas)
 # ============================================================
-
-def _fix_relationship_validity(
-    rel_detail: Optional[pd.DataFrame],
-    fk_report: pd.DataFrame,
-    diag_props: Optional[pd.DataFrame],
-) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[float], bool]:
-    """
-    Workaround para bug conhecido do SDMetrics (#0.28 + pandas 2.x): a
-    métrica ReferentialIntegrity falha internamente e retorna NaN, puxando o
-    score de Relationship Validity (e do diagnóstico) para baixo sem motivo.
-
-    Quando isso ocorre, o NaN é substituído pelo resultado da CHECAGEM
-    DIRETA deste módulo (que mede exatamente o mesmo: % de FKs válidas
-    contra o pai sintético), e o score do diagnóstico é recomposto.
-
-    Retorna (rel_detail_corrigido, diag_props_corrigido,
-             diag_score_recalculado, houve_ajuste).
-    """
-    if rel_detail is None or len(rel_detail) == 0:
-        return rel_detail, diag_props, None, False
-
-    rel = rel_detail.copy()
-    ajustou = False
-
-    fk_lookup = {}
-    for _, r in fk_report.iterrows():
-        fk_lookup[(r["tabela_filha"], r["fk"], r["tabela_pai"])] = (
-            r["%_validas"] / 100.0
-        )
-
-    for idx, row in rel.iterrows():
-        if row.get("Metric") != "ReferentialIntegrity":
-            continue
-        if pd.notna(row.get("Score")):
-            continue
-        key = (row["Child Table"], row["Foreign Key"], row["Parent Table"])
-        if key in fk_lookup:
-            rel.at[idx, "Score"] = fk_lookup[key]
-            if "Error" in rel.columns:
-                rel.at[idx, "Error"] = (
-                    "métrica SDMetrics falhou (bug lib); valor preenchido "
-                    "pela checagem direta deste relatório"
-                )
-            ajustou = True
-
-    if not ajustou:
-        return rel, diag_props, None, False
-
-    rel_score = float(rel["Score"].mean())
-
-    props = diag_props.copy() if diag_props is not None else None
-    novo_diag = None
-    if props is not None and "Property" in props.columns:
-        mask = props["Property"] == "Relationship Validity"
-        props.loc[mask, "Score"] = rel_score
-        novo_diag = float(props["Score"].mean())
-
-    return rel, props, novo_diag, True
-
 
 def _coerce_to_common_dtype(
     left: pd.Series,
     right: pd.Series,
 ) -> Tuple[pd.Series, pd.Series]:
     """
-    Garante que duas Series tenham dtype compatível para merge/isin.
-
-    Estratégia em cascata:
-        1. Se os dtypes já são iguais, retorna sem alterar.
-        2. Tenta coagir ambos para numérico (pd.to_numeric) — preserva
-           precisão para IDs inteiros/double.
-        3. Se falhar, converte ambos para string — funciona para qualquer
-           combinação de tipo (int64, object, float64, category, etc).
-
-    Isso resolve o ValueError:
-        "merging on string and int64 columns for key 'X'"
-    que acontece quando a PK do pai e a FK do filho têm dtypes diferentes
-    dentro do mesmo dataset sintético.
+    Coage duas Series para dtype compatível antes de merge/isin.
+    Resolve: ValueError "merging on string and int64 columns for key X"
     """
     if left.dtype == right.dtype:
         return left, right
-
     try:
         l2 = pd.to_numeric(left,  errors="raise")
         r2 = pd.to_numeric(right, errors="raise")
-        # Normaliza para float se um lado é inteiro e o outro float
         if l2.dtype != r2.dtype:
-            target = "float64" if ("float" in str(l2.dtype) or "float" in str(r2.dtype)) else "int64"
-            l2 = l2.astype(target)
-            r2 = r2.astype(target)
+            target = (
+                "float64"
+                if ("float" in str(l2.dtype) or "float" in str(r2.dtype))
+                else "int64"
+            )
+            l2, r2 = l2.astype(target), r2.astype(target)
         return l2, r2
     except (ValueError, TypeError):
-        pass
-
-    return left.astype(str), right.astype(str)
+        return left.astype(str), right.astype(str)
 
 
 def direct_integrity_checks(
@@ -440,36 +320,33 @@ def direct_integrity_checks(
     specs_config: Mapping[str, Mapping],
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Retorna (relatorio_pk, relatorio_fk) calculados direto em pandas.
-
-    Robusto contra dtype mismatch entre FK do filho e PK do pai dentro do
-    dataset sintético — o sintetizador pode inferir a mesma coluna como
-    int64 em uma tabela e float64/object em outra dependendo dos valores
-    presentes. A função coage os dois lados para um tipo comum antes de
-    qualquer merge, evitando o ValueError do pandas.
+    Checagem independente do SDMetrics:
+      • pk_report: unicidade, nulos e duplicatas por tabela
+      • fk_report: % de FKs válidas contra o pai sintético
+    Robusto contra dtype mismatch entre FK filho e PK pai.
     """
-    pk_rows, fk_rows = [], []
+    pk_rows: List[dict] = []
+    fk_rows: List[dict] = []
 
     for t, cfg in specs_config.items():
         if t not in synth:
             continue
-        df = synth[t]
+        df  = synth[t]
         pks = [c for c in _normalize_cols_cfg(cfg.get("pk_cols")) if c in df.columns]
+
         if pks:
-            n = len(df)
+            n        = len(df)
             distintas = len(df[pks].drop_duplicates())
-            nulas = int(df[pks].isna().any(axis=1).sum())
-            pk_rows.append(
-                {
-                    "tabela": t,
-                    "pk": ",".join(pks),
-                    "linhas": n,
-                    "pks_distintas": distintas,
-                    "pks_nulas": nulas,
-                    "pks_duplicadas": n - distintas,
-                    "status": "OK" if (n == distintas and nulas == 0) else "FALHA",
-                }
-            )
+            nulas     = int(df[pks].isna().any(axis=1).sum())
+            pk_rows.append({
+                "tabela":          t,
+                "pk":              ",".join(pks),
+                "linhas":          n,
+                "pks_distintas":   distintas,
+                "pks_nulas":       nulas,
+                "pks_duplicadas":  n - distintas,
+                "status":          "OK" if (n == distintas and nulas == 0) else "FALHA",
+            })
 
         for fk in (cfg.get("foreign_keys") or cfg.get("fks") or []):
             cols  = _normalize_cols_cfg(fk.get("columns"))
@@ -483,13 +360,15 @@ def direct_integrity_checks(
             if any(c not in synth[ptab].columns for c in pcols):
                 continue
 
-            # Remove linhas onde QUALQUER coluna da FK é nula
-            mask_nao_nulo = df[cols].notna().all(axis=1)
-            filhos_df = df.loc[mask_nao_nulo, cols].copy().reset_index(drop=True)
+            filhos_df = (
+                df.loc[df[cols].notna().all(axis=1), cols]
+                .copy()
+                .reset_index(drop=True)
+            )
             total = len(filhos_df)
 
             if total == 0:
-                pct, invalidas = 100.0, 0
+                invalidas, pct = 0, 100.0
             else:
                 pai_df = (
                     synth[ptab][pcols]
@@ -498,223 +377,251 @@ def direct_integrity_checks(
                     .copy()
                     .reset_index(drop=True)
                 )
-                pai_df.columns = cols  # renomeia para o nome da coluna filho
+                pai_df.columns = cols
 
-                # Coage dtypes coluna a coluna antes do merge
                 for i, col in enumerate(cols):
                     filhos_df[col], pai_df[col] = _coerce_to_common_dtype(
                         filhos_df[col], pai_df[col]
                     )
 
                 try:
-                    merged = filhos_df.merge(
-                        pai_df, on=cols, how="left", indicator=True
-                    )
+                    merged    = filhos_df.merge(pai_df, on=cols, how="left", indicator=True)
                     invalidas = int((merged["_merge"] == "left_only").sum())
-                except Exception as exc:
-                    # Fallback final: comparação via isin (funciona para FK simples)
-                    warnings.warn(
-                        f"FK {t}.{cols} -> {ptab}.{pcols}: merge falhou "
-                        f"({exc}); usando isin como fallback.",
-                        UserWarning,
-                        stacklevel=2,
-                    )
+                except Exception:
+                    # fallback: isin (funciona para FK simples)
                     if len(cols) == 1:
-                        pai_set = set(pai_df[cols[0]].astype(str).tolist())
-                        filho_vals = filhos_df[cols[0]].astype(str)
-                        invalidas = int((~filho_vals.isin(pai_set)).sum())
+                        pai_set   = set(pai_df[cols[0]].astype(str))
+                        invalidas = int((~filhos_df[cols[0]].astype(str).isin(pai_set)).sum())
                     else:
-                        invalidas = 0  # compostas: não sabemos, marca como OK
+                        invalidas = 0
 
                 pct = 100.0 * (total - invalidas) / total
 
-            fk_rows.append(
-                {
-                    "tabela_filha": t,
-                    "fk": ",".join(cols),
-                    "tabela_pai": ptab,
-                    "linhas_com_fk": total,
-                    "fk_invalidas": invalidas,
-                    "%_validas": round(pct, 2),
-                    "status": "OK" if invalidas == 0 else "ATENÇÃO",
-                }
-            )
+            fk_rows.append({
+                "tabela_filha":  t,
+                "fk":            ",".join(cols),
+                "tabela_pai":    ptab,
+                "total_fk":      total,
+                "invalidas":     invalidas,
+                "%_validas":     round(pct, 2),
+                "status":        "OK" if invalidas == 0 else "ATENÇÃO",
+            })
 
     return pd.DataFrame(pk_rows), pd.DataFrame(fk_rows)
 
 
 # ============================================================
-# 5. Painel HTML
+# 5. Workaround bug ReferentialIntegrity (SDMetrics x pandas 2.x)
 # ============================================================
 
-def _score_color(score: Optional[float]) -> str:
-    if score is None:
-        return AMBER
-    if score >= 0.9:
-        return TEAL
-    if score >= 0.75:
-        return AMBER
-    return RED
+def _fix_relationship_validity(
+    rel_detail:  Optional[pd.DataFrame],
+    fk_report:   pd.DataFrame,
+    diag_props:  Optional[pd.DataFrame],
+) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[float], bool]:
+    """
+    A métrica ReferentialIntegrity do SDMetrics falha com pandas ≥ 2.0 e
+    retorna NaN, derrubando o score do diagnóstico injustamente.
+    Substitui o NaN pelo resultado da checagem direta (que mede o mesmo) e
+    recompõe o score.
+    """
+    if rel_detail is None or len(rel_detail) == 0:
+        return rel_detail, diag_props, None, False
 
+    rel      = rel_detail.copy()
+    ajustou  = False
+    fk_lkp   = {
+        (r["tabela_filha"], r["fk"], r["tabela_pai"]): r["%_validas"] / 100.0
+        for _, r in fk_report.iterrows()
+    }
 
-def _card(titulo: str, score: Optional[float], legenda: str) -> str:
-    valor = "n/d" if score is None else f"{score * 100:.1f}%"
-    cor = _score_color(score)
-    return f"""
-    <div style="flex:1;min-width:200px;background:#fff;border:1px solid {ICE};
-                border-radius:10px;padding:18px;text-align:center;">
-      <div style="font-size:13px;color:{NAVY};font-weight:600;">{html.escape(titulo)}</div>
-      <div style="font-size:34px;font-weight:700;color:{cor};margin:6px 0;">{valor}</div>
-      <div style="font-size:11px;color:#555;">{html.escape(legenda)}</div>
-    </div>"""
+    for idx, row in rel.iterrows():
+        if row.get("Metric") != "ReferentialIntegrity":
+            continue
+        if pd.notna(row.get("Score")):
+            continue
+        key = (row["Child Table"], row["Foreign Key"], row["Parent Table"])
+        if key in fk_lkp:
+            rel.at[idx, "Score"] = fk_lkp[key]
+            if "Error" in rel.columns:
+                rel.at[idx, "Error"] = "bug lib; preenchido pela checagem direta"
+            ajustou = True
 
+    if not ajustou:
+        return rel, diag_props, None, False
 
-def _df_html(df: pd.DataFrame) -> str:
-    if df is None or len(df) == 0:
-        return "<p style='color:#777'>sem dados</p>"
-    styled = df.copy()
-    return styled.to_html(
-        index=False,
-        border=0,
-        classes="tbl",
-        float_format=lambda x: f"{x:.3f}",
-        na_rep="-",
-    )
+    rel_score  = float(rel["Score"].mean())
+    props      = diag_props.copy() if diag_props is not None else None
+    novo_diag  = None
 
+    if props is not None and "Property" in props.columns:
+        props.loc[props["Property"] == "Relationship Validity", "Score"] = rel_score
+        novo_diag = float(props["Score"].mean())
 
-def _build_html_panel(
-    *,
-    diag_score: Optional[float],
-    diag_props: Optional[pd.DataFrame],
-    qual_score: Optional[float],
-    qual_props: Optional[pd.DataFrame],
-    shapes_detail: Optional[pd.DataFrame],
-    rel_detail: Optional[pd.DataFrame],
-    card_detail: Optional[pd.DataFrame],
-    rel_ajustado: bool,
-    pk_report: pd.DataFrame,
-    fk_report: pd.DataFrame,
-    tabela_resumo: pd.DataFrame,
-    avisos: List[str],
-) -> str:
-    piores = ""
-    if shapes_detail is not None and len(shapes_detail) > 0 and "Score" in shapes_detail.columns:
-        piores_df = shapes_detail.sort_values("Score").head(10)
-        piores = f"""
-        <h2>Colunas com menor fidelidade de distribuição (top 10)</h2>
-        <p class="exp">Score 1.0 = distribuição sintética idêntica à original.
-        Colunas no fim da lista merecem inspeção visual.</p>
-        {_df_html(piores_df)}"""
-
-    nota_ajuste = ""
-    if rel_ajustado:
-        nota_ajuste = """
-        <p class="exp" style="color:#B45309;"><b>Nota:</b> a métrica
-        ReferentialIntegrity do SDMetrics falhou por incompatibilidade da
-        biblioteca com o pandas instalado; o valor exibido foi preenchido
-        pela checagem direta deste relatório, que mede o mesmo (% de FKs
-        sintéticas válidas contra o pai sintético).</p>"""
-
-    rel_html = ""
-    if rel_detail is not None and len(rel_detail) > 0:
-        rel_html = f"""
-        <h2>Integridade entre tabelas — detalhe por relacionamento</h2>
-        <p class="exp"><b>ReferentialIntegrity</b>: % de FKs que apontam para
-        uma PK existente (esperado 1.0 — é a garantia central do engine).<br>
-        <b>CardinalityBoundaryAdherence</b>: % de pais sintéticos cujo nº de
-        filhos cai dentro do min–max observado no original. Com bootstrap,
-        valores moderados aqui são ESPERADOS: pais sintéticos novos podem
-        nascer com 0 filhos sem violar nenhuma integridade.</p>
-        {nota_ajuste}
-        {_df_html(rel_detail)}"""
-
-    card_html = ""
-    if card_detail is not None and len(card_detail) > 0:
-        card_html = f"""
-        <h2>Fan-out — distribuição de filhos por pai</h2>
-        <p class="exp"><b>CardinalityShapeSimilarity</b>: compara a forma da
-        distribuição de filhos-por-pai entre original e sintético. Tende a
-        subir com volumes maiores; em tabelas pequenas oscila por amostragem.</p>
-        {_df_html(card_detail)}"""
-
-    avisos_html = ""
-    if avisos:
-        itens = "".join(f"<li>{html.escape(a)}</li>" for a in avisos)
-        avisos_html = f"""
-        <h2>Avisos durante a avaliação</h2>
-        <ul class="exp">{itens}</ul>"""
-
-    rel_validity = ""
-    if diag_props is not None and "Property" in getattr(diag_props, "columns", []):
-        rel_validity = _df_html(diag_props)
-
-    return f"""<!DOCTYPE html>
-<html lang="pt-BR"><head><meta charset="utf-8">
-<title>EngordAI — Relatório Sintético vs Original</title>
-<style>
-  body {{font-family:Segoe UI,Arial,sans-serif;background:{LIGHT};color:#222;
-        margin:0;padding:32px;}}
-  h1 {{color:{NAVY};margin-bottom:4px;}}
-  h2 {{color:{NAVY};border-bottom:2px solid {TEAL_BRIGHT};padding-bottom:4px;
-       margin-top:36px;}}
-  .sub {{color:#555;font-size:13px;margin-bottom:24px;}}
-  .cards {{display:flex;gap:16px;flex-wrap:wrap;margin:20px 0;}}
-  .exp {{font-size:13px;color:#444;}}
-  table.tbl {{border-collapse:collapse;width:100%;background:#fff;
-              font-size:13px;margin:10px 0;}}
-  table.tbl th {{background:{NAVY};color:#fff;padding:8px;text-align:left;}}
-  table.tbl td {{padding:7px 8px;border-bottom:1px solid {ICE};}}
-  table.tbl tr:nth-child(even) td {{background:{LIGHT};}}
-</style></head><body>
-
-<h1>EngordAI — Avaliação de Dados Sintéticos</h1>
-<div class="sub">Sintético vs Original · métricas SDMetrics (ecossistema SDV)
- · gerado em {datetime.now().strftime('%d/%m/%Y %H:%M')}</div>
-
-<div class="cards">
-  {_card("Diagnóstico (validade + integridade)", diag_score,
-         "esperado ~100%: PKs únicas, FKs válidas, estrutura preservada")}
-  {_card("Qualidade estatística", qual_score,
-         "fidelidade de distribuições, correlações e fan-out")}
-</div>
-
-<h2>Volumes por tabela</h2>
-{_df_html(tabela_resumo)}
-
-<h2>Diagnóstico — propriedades (SDMetrics)</h2>
-<p class="exp"><b>Data Validity</b>: valores válidos por coluna ·
-<b>Data Structure</b>: estrutura preservada ·
-<b>Relationship Validity</b>: integridade referencial FK→PK.</p>
-{rel_validity}
-
-{rel_html}
-
-<h2>Qualidade estatística — propriedades (SDMetrics)</h2>
-<p class="exp"><b>Column Shapes</b>: distribuição de cada coluna ·
-<b>Column Pair Trends</b>: correlações entre colunas ·
-<b>Cardinality</b>: nº de filhos por pai entre tabelas.</p>
-{_df_html(qual_props)}
-
-{card_html}
-
-<h2>Integridade direta — Primary Keys (checagem independente)</h2>
-{_df_html(pk_report)}
-
-<h2>Integridade direta — Foreign Keys (checagem independente)</h2>
-<p class="exp">FKs nulas são excluídas do cálculo (política de órfãos pode
-gerar nulos propositalmente).</p>
-{_df_html(fk_report)}
-
-{piores}
-{avisos_html}
-
-<p class="exp" style="margin-top:40px;color:#888;">
-GB Soluções de IA · EngordAI · relatório automático</p>
-</body></html>"""
+    return rel, props, novo_diag, True
 
 
 # ============================================================
-# 6. Função principal
+# 6. Helpers visuais (notebook)
+# ============================================================
+
+def _color_score(v: Optional[float]) -> str:
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return _AMBER
+    if v >= 0.90:
+        return _GREEN
+    if v >= 0.75:
+        return _AMBER
+    return _RED
+
+
+def _style_df(
+    df: pd.DataFrame,
+    score_col:  Optional[str] = "Score",
+    status_col: Optional[str] = "status",
+) -> "pd.io.formats.style.Styler":
+    """Aplica fundo colorido nas colunas de score e status."""
+    styler = df.style.set_table_styles([
+        {"selector": "th",
+         "props": f"background:{_NAVY};color:white;padding:6px 8px;text-align:left"},
+        {"selector": "td",
+         "props": "padding:5px 8px;"},
+        {"selector": "tr:nth-child(even) td",
+         "props": f"background:{_LIGHT}"},
+    ])
+
+    def _bg_score(v):
+        try:
+            c = _color_score(float(v))
+            return f"background-color:{c};color:white;font-weight:bold"
+        except Exception:
+            return ""
+
+    def _bg_status(v):
+        c = _GREEN if str(v).upper() == "OK" else _RED
+        return f"background-color:{c};color:white;font-weight:bold"
+
+    if score_col and score_col in df.columns:
+        styler = styler.applymap(_bg_score, subset=[score_col])
+    if status_col and status_col in df.columns:
+        styler = styler.applymap(_bg_status, subset=[status_col])
+
+    return styler
+
+
+def _scorecard(scores: List[Tuple[str, Optional[float], str]]):
+    """Barras horizontais coloridas — uma por score."""
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    n    = len(scores)
+    fig, axes = plt.subplots(1, n, figsize=(4.5 * n, 2.4))
+    if n == 1:
+        axes = [axes]
+
+    for ax, (titulo, valor, legenda) in zip(axes, scores):
+        cor = _color_score(valor)
+        pct = (valor or 0) * 100
+        ax.barh([0], [pct],       color=cor,      height=0.45)
+        ax.barh([0], [100 - pct], left=[pct],
+                color="#E5E7EB", height=0.45)
+        ax.set_xlim(0, 100)
+        ax.set_yticks([])
+        ax.set_xticks([0, 25, 50, 75, 100])
+        ax.tick_params(labelsize=8)
+        lbl = f"{pct:.1f}%" if valor is not None else "n/d"
+        ax.text(50, 0, lbl, ha="center", va="center",
+                fontsize=17, fontweight="bold", color="white",
+                bbox=dict(boxstyle="round,pad=0.2", fc=cor, ec="none", alpha=0.9))
+        ax.set_title(titulo, fontsize=10, fontweight="bold",
+                     color=_NAVY, pad=8)
+        ax.set_xlabel(legenda, fontsize=7.5, color="#555")
+        sns.despine(ax=ax, left=True, bottom=False)
+
+    fig.tight_layout(pad=1.5)
+    plt.show()
+    plt.close(fig)
+
+
+def _dist_plots(
+    real:  Dict[str, pd.DataFrame],
+    synth: Dict[str, pd.DataFrame],
+):
+    """Histogramas (numéricas) e barras agrupadas (categóricas) por tabela.
+    Plota todas as colunas elegíveis — numéricas com mais de 2 valores
+    distintos e categóricas com até 30 categorias.
+    """
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from IPython.display import display, Markdown
+
+    for tabela in sorted(real):
+        r_df = real[tabela]
+        s_df = synth[tabela]
+
+        num_cols = [
+            c for c in r_df.columns
+            if pd.api.types.is_numeric_dtype(r_df[c]) and r_df[c].nunique() > 2
+        ]
+        cat_cols = [
+            c for c in r_df.columns
+            if not pd.api.types.is_numeric_dtype(r_df[c])
+            and 2 < r_df[c].nunique() <= 30
+        ]
+        plotar = num_cols + cat_cols
+
+        if not plotar:
+            continue
+
+        display(Markdown(f"**Distribuições — `{tabela}`**"))
+        n    = len(plotar)
+        fig, axes = plt.subplots(1, n, figsize=(4 * n, 3.2))
+        if n == 1:
+            axes = [axes]
+
+        for ax, col in zip(axes, plotar):
+            r_vals = r_df[col].dropna()
+            s_vals = (
+                s_df[col].dropna()
+                if col in s_df.columns
+                else pd.Series(dtype=r_vals.dtype)
+            )
+
+            if pd.api.types.is_numeric_dtype(r_vals):
+                mn   = min(r_vals.min(), s_vals.min() if len(s_vals) else r_vals.min())
+                mx   = max(r_vals.max(), s_vals.max() if len(s_vals) else r_vals.max())
+                bins = np.linspace(mn, mx, 25)
+                ax.hist(r_vals, bins=bins, alpha=0.55,
+                        color=_NAVY, label="Original", density=True)
+                ax.hist(s_vals, bins=bins, alpha=0.55,
+                        color=_TEAL, label="Sintético", density=True)
+            else:
+                order  = r_vals.value_counts().index[:12].tolist()
+                r_pct  = r_vals.value_counts(normalize=True).reindex(order, fill_value=0)
+                s_pct  = s_vals.value_counts(normalize=True).reindex(order, fill_value=0)
+                x      = np.arange(len(order))
+                ax.bar(x - 0.18, r_pct.values, 0.35,
+                       color=_NAVY, alpha=0.8, label="Original")
+                ax.bar(x + 0.18, s_pct.values, 0.35,
+                       color=_TEAL, alpha=0.8, label="Sintético")
+                ax.set_xticks(x)
+                ax.set_xticklabels(
+                    [str(v)[:14] for v in order],
+                    rotation=35, ha="right", fontsize=7,
+                )
+
+            ax.set_title(col, fontsize=9, fontweight="bold", color=_NAVY)
+            ax.legend(fontsize=7)
+            ax.set_ylabel("freq. relativa", fontsize=7)
+            sns.despine(ax=ax)
+
+        fig.tight_layout()
+        plt.show()
+        plt.close(fig)
+
+
+# ============================================================
+# 7. Função principal  (mesmo nome, exibe inline no notebook)
 # ============================================================
 
 def run_comparison_report(
@@ -724,112 +631,120 @@ def run_comparison_report(
     specs_config: Mapping[str, Mapping],
     original_format: str = "csv",
     synthetic_format: str = "csv",
-    output_html: str = "relatorio_engordai.html",
     max_rows: Optional[int] = None,
-    verbose: bool = True,
+    show_distribution_plots: bool = True,
+    verbose: bool = False,
 ) -> Dict[str, Any]:
     """
-    Compara sintético vs original em TODAS as tabelas e gera painel HTML.
+    Compara sintético vs original e exibe o relatório INLINE no notebook.
 
-    Args:
-        original_table_paths: MESMO dict de caminhos usado na síntese
-            (cada valor pode ser arquivo único ou pasta).
-        synthetic_path: MESMO save_path usado na síntese; espera-se
-            synthetic_path/<TABELA>/ por tabela.
-        specs_config: MESMO specs_config da síntese (PKs e FKs).
-        original_format / synthetic_format: "csv" ou "parquet"
-            (synthetic_format = save_format usado na síntese).
-        output_html: caminho do painel gerado.
-        max_rows: se definido, amostra cada tabela para acelerar métricas
-            (recomendado p/ tabelas com milhões de linhas, ex.: 50_000).
+    Parâmetros
+    ----------
+    original_table_paths    : mesmo dict de paths usado na síntese
+    synthetic_path          : mesmo save_path da síntese
+                              (espera synthetic_path/<TABELA>/ por tabela)
+    specs_config            : mesmo specs_config da síntese (PKs e FKs)
+    original_format         : "csv" ou "parquet"
+    synthetic_format        : "csv" ou "parquet" (= save_format da síntese)
+    max_rows                : amostra cada tabela para acelerar métricas
+                              (recomendado para tabelas com milhões de linhas)
+    show_distribution_plots : exibe gráficos original vs sintético por coluna
+    verbose                 : passa verbose para o SDMetrics
 
-    Retorna dict com: diagnostic_score, quality_score, diagnostic_report,
-    quality_report, pk_report, fk_report, html_path.
+    Retorna
+    -------
+    dict com: diagnostic_score, quality_score, diagnostic_report,
+              quality_report, pk_report, fk_report, resumo_tabelas
     """
-    avisos: List[str] = []
+    from IPython.display import display, Markdown
 
-    def _capturar(ws):
-        for w in ws:
-            avisos.append(str(w.message))
+    def _sec(titulo: str, emoji: str = ""):
+        display(Markdown(f"---\n### {emoji} {titulo}"))
 
-    print("=" * 64)
-    print("1/5 Lendo dados ORIGINAIS...")
-    with warnings.catch_warnings(record=True) as ws:
-        warnings.simplefilter("always")
-        real = _load_all(
-            original_table_paths, original_format,
-            label="original", max_rows=max_rows,
-        )
-        _capturar(ws)
+    # ── 1. leitura ───────────────────────────────────────────
+    display(Markdown("# 📊 EngordAI — Avaliação Sintético vs Original"))
+    print("Lendo dados originais...")
+    real = _load_all(
+        original_table_paths, original_format,
+        label="original", max_rows=max_rows,
+    )
 
-    print("2/5 Lendo dados SINTÉTICOS...")
+    print("Lendo dados sintéticos...")
     synth_paths = {
         t: os.path.join(os.path.expanduser(synthetic_path.rstrip("/")), t)
         for t in original_table_paths
     }
-    with warnings.catch_warnings(record=True) as ws:
-        warnings.simplefilter("always")
-        synth = _load_all(
-            synth_paths, synthetic_format,
-            label="sintético", max_rows=max_rows,
-        )
-        _capturar(ws)
-
-    print("3/5 Alinhando schemas e montando metadata...")
-    with warnings.catch_warnings(record=True) as ws:
-        warnings.simplefilter("always")
-        real, synth = _align_tables(real, synth)
-        metadata = build_sdmetrics_metadata(real, specs_config)
-        _capturar(ws)
-
-    tabela_resumo = pd.DataFrame(
-        [
-            {
-                "tabela": t,
-                "linhas_original": len(real[t]),
-                "linhas_sintetico": len(synth[t]),
-                "fator": round(len(synth[t]) / max(len(real[t]), 1), 2),
-                "colunas": len(real[t].columns),
-            }
-            for t in sorted(real)
-        ]
+    synth = _load_all(
+        synth_paths, synthetic_format,
+        label="sintético", max_rows=max_rows,
     )
 
-    print("4/5 Rodando métricas SDMetrics (diagnóstico + qualidade)...")
+    with _silence():
+        real, synth = _align_tables(real, synth)
+        metadata    = build_sdmetrics_metadata(real, specs_config)
+
+    # ── 2. volumes ───────────────────────────────────────────
+    _sec("Volumes por tabela", "📋")
+    vol = pd.DataFrame([
+        {
+            "tabela":            t,
+            "linhas_original":   len(real[t]),
+            "linhas_sintético":  len(synth[t]),
+            "fator_x":           round(len(synth[t]) / max(len(real[t]), 1), 2),
+            "colunas":           len(real[t].columns),
+        }
+        for t in sorted(real)
+    ])
+    display(
+        vol.style
+        .format({"fator_x": "{:.2f}×"})
+        .set_table_styles([
+            {"selector": "th",
+             "props": f"background:{_NAVY};color:white;padding:6px 8px"},
+            {"selector": "td", "props": "padding:5px 8px"},
+        ])
+    )
+
+    # ── 3. métricas SDMetrics ────────────────────────────────
+    print("Calculando métricas SDMetrics (warnings internos suprimidos)...")
     diag_score = qual_score = None
     diag_props = qual_props = shapes_detail = None
     rel_detail = card_detail = None
     diag = qual = None
 
-    try:
-        diag = DiagnosticReport()
-        diag.generate(real, synth, metadata, verbose=verbose)
-        diag_score = float(diag.get_score())
-        diag_props = diag.get_properties()
+    with _silence():
         try:
-            rel_detail = diag.get_details("Relationship Validity")
-        except Exception:
-            rel_detail = None
-    except Exception as exc:
-        avisos.append(f"DiagnosticReport falhou: {exc}")
+            diag = DiagnosticReport()
+            diag.generate(real, synth, metadata, verbose=verbose)
+            diag_score = float(diag.get_score())
+            diag_props = diag.get_properties()
+            try:
+                rel_detail = diag.get_details("Relationship Validity")
+            except Exception:
+                pass
+        except Exception as exc:
+            print(f"  ⚠ DiagnosticReport: {exc}")
 
-    try:
-        qual = QualityReport()
-        qual.generate(real, synth, metadata, verbose=verbose)
-        qual_score = float(qual.get_score())
-        qual_props = qual.get_properties()
-        shapes_detail = qual.get_details("Column Shapes")
         try:
-            card_detail = qual.get_details("Cardinality")
-        except Exception:
-            card_detail = None
-    except Exception as exc:
-        avisos.append(f"QualityReport falhou: {exc}")
+            qual = QualityReport()
+            qual.generate(real, synth, metadata, verbose=verbose)
+            qual_score = float(qual.get_score())
+            qual_props = qual.get_properties()
+            try:
+                shapes_detail = qual.get_details("Column Shapes")
+            except Exception:
+                pass
+            try:
+                card_detail = qual.get_details("Cardinality")
+            except Exception:
+                pass
+        except Exception as exc:
+            print(f"  ⚠ QualityReport: {exc}")
 
+    # ── 4. integridade direta ────────────────────────────────
     pk_report, fk_report = direct_integrity_checks(synth, specs_config)
 
-    # Workaround do bug ReferentialIntegrity (SDMetrics x pandas 2.x):
-    # NaN é preenchido pela checagem direta e o score é recomposto.
+    # corrige bug ReferentialIntegrity
     rel_detail, diag_props_fix, diag_score_fix, rel_ajustado = (
         _fix_relationship_validity(rel_detail, fk_report, diag_props)
     )
@@ -837,83 +752,179 @@ def run_comparison_report(
         diag_props = diag_props_fix
         if diag_score_fix is not None:
             diag_score = diag_score_fix
-        avisos.append(
-            "ReferentialIntegrity do SDMetrics falhou (incompatibilidade da "
-            "lib com o pandas instalado); valor reposto pela checagem direta "
-            "e score do diagnóstico recomposto."
-        )
 
-    print("5/5 Gerando painel HTML...")
-    html_doc = _build_html_panel(
-        diag_score=diag_score,
-        diag_props=diag_props,
-        qual_score=qual_score,
-        qual_props=qual_props,
-        shapes_detail=shapes_detail,
-        rel_detail=rel_detail,
-        card_detail=card_detail,
-        rel_ajustado=rel_ajustado,
-        pk_report=pk_report,
-        fk_report=fk_report,
-        tabela_resumo=tabela_resumo,
-        avisos=avisos,
-    )
-    output_html = os.path.expanduser(output_html)
-    with open(output_html, "w", encoding="utf-8") as f:
-        f.write(html_doc)
+    # ── 5. scorecard ─────────────────────────────────────────
+    _sec("Visão Geral", "🎯")
+    display(Markdown(
+        "Os dois scores abaixo resumem a qualidade do dado sintético. "
+        "**Verde** (≥ 90%) significa excelente. **Amarelo** (≥ 75%) é aceitável "
+        "com ressalvas. **Vermelho** (< 75%) indica que algo precisa de atenção."
+    ))
+    _scorecard([
+        ("Diagnóstico\n(validade + integridade)",
+         diag_score,
+         "≥ 90%: PKs únicas · FKs válidas · estrutura preservada"),
+        ("Qualidade estatística",
+         qual_score,
+         "fidelidade de distribuições · correlações · fan-out"),
+    ])
 
-    print("\n" + "=" * 64)
-    print("RESUMO")
-    print("=" * 64)
-    if diag_score is not None:
-        print(f"  Diagnóstico (validade+integridade): {diag_score * 100:.1f}%")
-    if qual_score is not None:
-        print(f"  Qualidade estatística:              {qual_score * 100:.1f}%")
+    # ── 6. diagnóstico ───────────────────────────────────────
+    _sec("Diagnóstico de Integridade", "🔍")
+    display(Markdown(
+        "> **O que é?** Verifica se o dado sintético é _estruturalmente correto_: "
+        "se cada registro tem um identificador único, se as tabelas têm as mesmas "
+        "colunas do original e se todo registro filho aponta para um registro pai que existe. "
+        "Pense nisso como a _revisão técnica_: o dado não pode ser usado se não "
+        "passar aqui. Score esperado: **≥ 90%**."
+    ))
+    display(Markdown("""
+| Métrica | O que mede | Valor ideal |
+|---|---|---|
+| **Data Validity** | Cada coluna tem valores dentro do esperado (tipos corretos, sem lixo) | 100% |
+| **Data Structure** | O dado sintético tem as mesmas colunas que o original | 100% |
+| **Relationship Validity** | Todo registro filho aponta para um pai que existe (integridade FK→PK) | 100% |
+"""))
+    if diag_props is not None:
+        display(_style_df(diag_props.round(3), score_col="Score", status_col=None))
+
+    if rel_detail is not None and len(rel_detail) > 0:
+        display(Markdown(
+            "**Detalhe por relacionamento** — cada linha é um vínculo entre tabelas "
+            "(ex.: CONTA → ENTIDADE). `ReferentialIntegrity` = % de registros filhos "
+            "que têm um pai válido. `CardinalityBoundaryAdherence` = % de pais cujo "
+            "número de filhos está dentro da faixa observada no original."
+        ))
+        if rel_ajustado:
+            display(Markdown(
+                "> ℹ️ `ReferentialIntegrity` retornou erro interno na biblioteca SDMetrics "
+                "(incompatibilidade com a versão do pandas instalada); o valor foi "
+                "substituído automaticamente pela checagem direta, que mede o mesmo."
+            ))
+        cols_show = [
+            c for c in ["Parent Table", "Child Table", "Metric", "Score", "Error"]
+            if c in rel_detail.columns
+        ]
+        display(_style_df(rel_detail[cols_show].round(3), score_col="Score", status_col=None))
+
+    # ── 7. qualidade estatística ──────────────────────────────
+    _sec("Qualidade Estatística", "📈")
+    display(Markdown(
+        "> **O que é?** Mede se o dado sintético _se comporta_ como o original: "
+        "se as distribuições de cada variável são parecidas, se as correlações "
+        "entre variáveis foram preservadas e se a proporção de filhos por pai "
+        "continua realista. É a _revisão analítica_: um dado pode ser "
+        "estruturalmente correto mas estatisticamente inútil. Score esperado: "
+        "**≥ 75%** (valores acima de 80% são considerados excelentes pela comunidade SDV)."
+    ))
+    display(Markdown("""
+| Métrica | O que mede | Valor ideal |
+|---|---|---|
+| **Column Shapes** | A distribuição de cada coluna individual é parecida com o original? (histograma similar) | ≥ 80% |
+| **Column Pair Trends** | As correlações entre pares de colunas foram preservadas? (ex.: renda e saldo ainda sobem juntos?) | ≥ 70% |
+| **Cardinality** | A proporção de filhos por pai (ex.: quantas contas por cliente) continua realista? | ≥ 70% |
+"""))
+    if qual_props is not None:
+        display(_style_df(qual_props.round(3), score_col="Score", status_col=None))
+
+    if card_detail is not None and len(card_detail) > 0:
+        display(Markdown(
+            "**Fan-out por relacionamento** — compara a curva de quantos filhos "
+            "cada pai tem entre original e sintético. Score alto = a distribuição "
+            "de clientes com 1, 2, 3 contas é parecida."
+        ))
+        display(_style_df(card_detail.round(3), score_col="Score", status_col=None))
+
+    if shapes_detail is not None and "Score" in shapes_detail.columns:
+        piores = shapes_detail.sort_values("Score").head(10)
+        display(Markdown(
+            "**10 colunas com menor fidelidade de distribuição** — "
+            "estas merecem atenção especial. Score 1.0 = distribuição idêntica ao original. "
+            "Colunas com score baixo podem ter tido poucos valores distintos no original "
+            "(alta cardinalidade) ou conter muitos nulos."
+        ))
+        display(_style_df(piores.round(3), score_col="Score", status_col=None))
+
+    # ── 8. integridade direta PKs ────────────────────────────
+    _sec("Integridade das Chaves Primárias (PK)", "🔑")
+    display(Markdown(
+        "> **O que é?** Verifica se cada tabela sintética tem identificadores únicos e válidos. "
+        "Uma chave primária duplicada ou nula quebraria qualquer sistema que usasse o dado. "
+        "Esta checagem é calculada diretamente (independente do SDMetrics). "
+        "**Esperado: status OK em todas as tabelas.**"
+    ))
+    display(Markdown("""
+| Coluna | O que significa |
+|---|---|
+| **linhas** | Total de registros gerados |
+| **pks_distintas** | Quantas chaves únicas existem (deve ser = linhas) |
+| **pks_nulas** | Registros sem identificador (deve ser 0) |
+| **pks_duplicadas** | Registros com ID repetido (deve ser 0) |
+"""))
     if len(pk_report):
-        falhas_pk = (pk_report["status"] != "OK").sum()
-        print(f"  PKs: {len(pk_report)} tabela(s), {falhas_pk} com problema")
+        display(_style_df(pk_report, score_col=None, status_col="status"))
+    else:
+        display(Markdown("_Nenhuma PK declarada._"))
+
+    # ── 9. integridade direta FKs ────────────────────────────
+    _sec("Integridade das Chaves Estrangeiras (FK)", "🔗")
+    display(Markdown(
+        "> **O que é?** Verifica se os vínculos entre tabelas estão corretos. "
+        "Todo registro filho (ex.: CONTA) deve apontar para um registro "
+        "pai (ex.: ENTIDADE) que realmente existe no dado sintético. "
+        "Registros com FK nula são excluídos do cálculo: podem ser "
+        "orfaos intencionais gerados pela politica do sintetizador. "
+        "Esta checagem e calculada diretamente. **Esperado: 100% validas.**"
+    ))
+    display(Markdown("""
+| Coluna | O que significa |
+|---|---|
+| **total_fk** | Registros filhos com FK não-nula avaliados |
+| **invalidas** | FKs que não encontraram um pai válido (deve ser 0) |
+| **%_validas** | Percentual de FKs com pai existente (deve ser 100%) |
+"""))
     if len(fk_report):
-        falhas_fk = (fk_report["status"] != "OK").sum()
-        print(f"  FKs: {len(fk_report)} relacionamento(s), {falhas_fk} com órfãos")
-    print(f"  Painel: {output_html}")
+        display(_style_df(fk_report, score_col=None, status_col="status"))
+    else:
+        display(Markdown("_Nenhuma FK declarada._"))
+
+    # ── 10. distribuições ────────────────────────────────────
+    if show_distribution_plots:
+        _sec("Distribuições: Original vs Sintético", "📊")
+        display(Markdown(
+            "> **O que é?** Compara visualmente a forma da distribuição de cada "
+            "variável entre o dado original e o sintético. "
+            "**Barras sobrepostas** = o sintetizador reproduziu bem aquela variável. "
+            "**Barras muito diferentes** = a distribuição foi alterada (pode ser "
+            "aceitável dependendo do objetivo, mas vale investigar)."
+        ))
+        display(Markdown(
+            "🔵 **Azul escuro** = original &nbsp;·&nbsp; "
+            "🩵 **Verde azulado** = sintético"
+        ))
+        _dist_plots(real, synth)
+
+    # ── 11. resumo final ─────────────────────────────────────
+    display(Markdown("---"))
+    falhas_pk = int((pk_report["status"] != "OK").sum()) if len(pk_report) else 0
+    falhas_fk = int((fk_report["status"] != "OK").sum()) if len(fk_report) else 0
+    icone     = "✅" if (falhas_pk == 0 and falhas_fk == 0) else "⚠️"
+    d_txt     = f"{diag_score * 100:.1f}%" if diag_score is not None else "n/d"
+    q_txt     = f"{qual_score * 100:.1f}%" if qual_score is not None else "n/d"
+    display(Markdown(
+        f"**{icone} Resumo final** &nbsp;·&nbsp; "
+        f"Diagnóstico: **{d_txt}** &nbsp;·&nbsp; "
+        f"Qualidade: **{q_txt}** &nbsp;·&nbsp; "
+        f"PKs com problema: **{falhas_pk}** &nbsp;·&nbsp; "
+        f"FKs com órfãos: **{falhas_fk}**"
+    ))
 
     return {
-        "diagnostic_score": diag_score,
-        "quality_score": qual_score,
+        "diagnostic_score":  diag_score,
+        "quality_score":     qual_score,
         "diagnostic_report": diag,
-        "quality_report": qual,
-        "pk_report": pk_report,
-        "fk_report": fk_report,
-        "resumo_tabelas": tabela_resumo,
-        "html_path": output_html,
-        "avisos": avisos,
+        "quality_report":    qual,
+        "pk_report":         pk_report,
+        "fk_report":         fk_report,
+        "resumo_tabelas":    vol,
     }
-
-
-if __name__ == "__main__":
-    # Exemplo mínimo (ajuste os caminhos para o seu ambiente):
-    exemplo_paths = {
-        "ENTIDADE": "./dados/ENTIDADE.csv",
-        "CONTA": "./dados/CONTA.csv",
-    }
-    exemplo_specs = {
-        "ENTIDADE": {"pk_cols": ["NUM_ID_ENTIDADE"]},
-        "CONTA": {
-            "pk_cols": ["NUM_ID_CONTA"],
-            "foreign_keys": [
-                {
-                    "columns": ["NUM_ID_ENTIDADE"],
-                    "parent_table": "ENTIDADE",
-                    "parent_columns": ["NUM_ID_ENTIDADE"],
-                }
-            ],
-        },
-    }
-    run_comparison_report(
-        original_table_paths=exemplo_paths,
-        synthetic_path="./csv",
-        specs_config=exemplo_specs,
-        original_format="csv",
-        synthetic_format="csv",
-        output_html="relatorio_engordai.html",
-    )

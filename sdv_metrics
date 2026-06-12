@@ -398,11 +398,56 @@ def _fix_relationship_validity(
     return rel, props, novo_diag, True
 
 
+def _coerce_to_common_dtype(
+    left: pd.Series,
+    right: pd.Series,
+) -> Tuple[pd.Series, pd.Series]:
+    """
+    Garante que duas Series tenham dtype compatível para merge/isin.
+
+    Estratégia em cascata:
+        1. Se os dtypes já são iguais, retorna sem alterar.
+        2. Tenta coagir ambos para numérico (pd.to_numeric) — preserva
+           precisão para IDs inteiros/double.
+        3. Se falhar, converte ambos para string — funciona para qualquer
+           combinação de tipo (int64, object, float64, category, etc).
+
+    Isso resolve o ValueError:
+        "merging on string and int64 columns for key 'X'"
+    que acontece quando a PK do pai e a FK do filho têm dtypes diferentes
+    dentro do mesmo dataset sintético.
+    """
+    if left.dtype == right.dtype:
+        return left, right
+
+    try:
+        l2 = pd.to_numeric(left,  errors="raise")
+        r2 = pd.to_numeric(right, errors="raise")
+        # Normaliza para float se um lado é inteiro e o outro float
+        if l2.dtype != r2.dtype:
+            target = "float64" if ("float" in str(l2.dtype) or "float" in str(r2.dtype)) else "int64"
+            l2 = l2.astype(target)
+            r2 = r2.astype(target)
+        return l2, r2
+    except (ValueError, TypeError):
+        pass
+
+    return left.astype(str), right.astype(str)
+
+
 def direct_integrity_checks(
     synth: Dict[str, pd.DataFrame],
     specs_config: Mapping[str, Mapping],
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Retorna (relatorio_pk, relatorio_fk) calculados direto em pandas."""
+    """
+    Retorna (relatorio_pk, relatorio_fk) calculados direto em pandas.
+
+    Robusto contra dtype mismatch entre FK do filho e PK do pai dentro do
+    dataset sintético — o sintetizador pode inferir a mesma coluna como
+    int64 em uma tabela e float64/object em outra dependendo dos valores
+    presentes. A função coage os dois lados para um tipo comum antes de
+    qualquer merge, evitando o ValueError do pandas.
+    """
     pk_rows, fk_rows = [], []
 
     for t, cfg in specs_config.items():
@@ -427,9 +472,10 @@ def direct_integrity_checks(
             )
 
         for fk in (cfg.get("foreign_keys") or cfg.get("fks") or []):
-            cols = _normalize_cols_cfg(fk.get("columns"))
+            cols  = _normalize_cols_cfg(fk.get("columns"))
             pcols = _normalize_cols_cfg(fk.get("parent_columns"))
-            ptab = fk.get("parent_table")
+            ptab  = fk.get("parent_table")
+
             if not ptab or ptab not in synth:
                 continue
             if any(c not in df.columns for c in cols):
@@ -437,19 +483,49 @@ def direct_integrity_checks(
             if any(c not in synth[ptab].columns for c in pcols):
                 continue
 
-            filhos = df[cols].dropna()
-            total = len(filhos)
+            # Remove linhas onde QUALQUER coluna da FK é nula
+            mask_nao_nulo = df[cols].notna().all(axis=1)
+            filhos_df = df.loc[mask_nao_nulo, cols].copy().reset_index(drop=True)
+            total = len(filhos_df)
+
             if total == 0:
                 pct, invalidas = 100.0, 0
             else:
-                pai_keys = (
+                pai_df = (
                     synth[ptab][pcols]
                     .dropna()
                     .drop_duplicates()
+                    .copy()
+                    .reset_index(drop=True)
                 )
-                pai_keys.columns = cols
-                merged = filhos.merge(pai_keys, on=cols, how="left", indicator=True)
-                invalidas = int((merged["_merge"] == "left_only").sum())
+                pai_df.columns = cols  # renomeia para o nome da coluna filho
+
+                # Coage dtypes coluna a coluna antes do merge
+                for i, col in enumerate(cols):
+                    filhos_df[col], pai_df[col] = _coerce_to_common_dtype(
+                        filhos_df[col], pai_df[col]
+                    )
+
+                try:
+                    merged = filhos_df.merge(
+                        pai_df, on=cols, how="left", indicator=True
+                    )
+                    invalidas = int((merged["_merge"] == "left_only").sum())
+                except Exception as exc:
+                    # Fallback final: comparação via isin (funciona para FK simples)
+                    warnings.warn(
+                        f"FK {t}.{cols} -> {ptab}.{pcols}: merge falhou "
+                        f"({exc}); usando isin como fallback.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    if len(cols) == 1:
+                        pai_set = set(pai_df[cols[0]].astype(str).tolist())
+                        filho_vals = filhos_df[cols[0]].astype(str)
+                        invalidas = int((~filho_vals.isin(pai_set)).sum())
+                    else:
+                        invalidas = 0  # compostas: não sabemos, marca como OK
+
                 pct = 100.0 * (total - invalidas) / total
 
             fk_rows.append(

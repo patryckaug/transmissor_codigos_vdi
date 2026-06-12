@@ -77,11 +77,66 @@ AMBER = "#B45309"
 # 1. Leitura de tabelas (arquivo único OU pasta com part-files)
 # ============================================================
 
+def _read_csv_robust(filepath: str) -> pd.DataFrame:
+    """
+    Lê UM arquivo CSV com fallback automático para os problemas mais comuns
+    nos CSVs do Spark/Oracle/B3:
+
+        ParseError: Expected N fields, saw M
+            -> vírgula dentro de um campo sem aspas (comum em descrições
+               e nomes de empresas do CDB).
+
+        UnicodeDecodeError
+            -> encoding latin-1 / cp1252 no lugar de UTF-8.
+
+        Separador errado
+            -> arquivo gerado com ";" em vez de ",".
+
+    Ordem de tentativas (para na primeira que funcionar):
+        1. C engine, utf-8-sig, sep=","      <- mais rápido, tenta primeiro
+        2. C engine, latin-1,   sep=","
+        3. Python engine, utf-8-sig, sep=","  <- mais tolerante a má formação
+        4. Python engine, latin-1,   sep=","
+        5. Python engine, latin-1,   sep=";"  <- separador alternativo
+    """
+    attempts = [
+        dict(engine="c",      encoding="utf-8-sig", sep=","),
+        dict(engine="c",      encoding="latin-1",   sep=","),
+        dict(engine="python", encoding="utf-8-sig", sep=","),
+        dict(engine="python", encoding="latin-1",   sep=","),
+        dict(engine="python", encoding="latin-1",   sep=";"),
+    ]
+    last_exc: Exception = RuntimeError("falha desconhecida")
+    for kw in attempts:
+        try:
+            df = pd.read_csv(
+                filepath,
+                on_bad_lines="warn",   # pula linhas corrompidas com aviso
+                **kw,
+            )
+            # Sanidade: se resultou em 1 coluna mas sep=",", provavelmente
+            # o separador real é ";" — descarta e tenta o próximo.
+            if len(df.columns) == 1 and kw["sep"] == ",":
+                last_exc = ValueError("1 coluna com sep=','; tentando ';'")
+                continue
+            return df
+        except Exception as exc:
+            last_exc = exc
+    raise RuntimeError(
+        f"Não foi possível ler '{filepath}' após todas as tentativas.\n"
+        f"Último erro: {last_exc}"
+    )
+
+
 def _load_table(path: str, fmt: str) -> pd.DataFrame:
     """
     Lê uma tabela de um arquivo único ou de uma PASTA gerada pelo Spark
     (part-00000-*.csv / *.parquet + _SUCCESS), formato em que o
     sintetizador salva cada tabela em save_path/<TABELA>/.
+
+    Para CSV usa _read_csv_robust: suporta campos com vírgula sem aspas,
+    encodings latin-1/UTF-8 e separadores alternativos — não quebra mesmo
+    com CSVs gerados por ferramentas diversas do B3/CDB.
     """
     fmt = (fmt or "csv").lower()
     path = os.path.expanduser(str(path).rstrip("/"))
@@ -89,25 +144,28 @@ def _load_table(path: str, fmt: str) -> pd.DataFrame:
     if not os.path.exists(path):
         raise FileNotFoundError(f"Caminho não encontrado: {path}")
 
-    if os.path.isdir(path):
-        if fmt == "parquet":
-            return pd.read_parquet(path)  # pyarrow lê a pasta inteira
+    # ---- PARQUET ----
+    if fmt == "parquet":
+        return pd.read_parquet(path)   # pyarrow lê arquivo ou pasta
 
+    # ---- CSV: pasta com part-files do Spark ----
+    if os.path.isdir(path):
         partes = sorted(glob.glob(os.path.join(path, "*.csv")))
         if not partes:
             partes = sorted(glob.glob(os.path.join(path, "part-*")))
         if not partes:
-            raise FileNotFoundError(f"Nenhum arquivo de dados em: {path}")
-
+            raise FileNotFoundError(
+                f"Nenhum arquivo CSV em: {path}\n"
+                "Verifique se save_format='csv' foi usado na síntese, "
+                "ou use synthetic_format='parquet' para evitar o problema."
+            )
         return pd.concat(
-            (pd.read_csv(p) for p in partes),
+            (_read_csv_robust(p) for p in partes),
             ignore_index=True,
         )
 
-    if fmt == "parquet":
-        return pd.read_parquet(path)
-
-    return pd.read_csv(path)
+    # ---- CSV: arquivo único ----
+    return _read_csv_robust(path)
 
 
 def _load_all(

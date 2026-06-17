@@ -19,6 +19,26 @@ Uso
         synthetic_format     = "csv",          # mesmo save_format usado
     )
 
+OCI Object Storage
+------------------
+Qualquer caminho (original ou sintético) pode ser um URI oci://; o loader
+detecta o esquema e usa o OCIFileSystem (pacote ocifs) automaticamente.
+Os part-files do Spark/Data Flow sob o prefixo são listados e concatenados.
+
+    resultado = run_comparison_report(
+        original_table_paths = {
+            "ENTIDADE": "oci://bkt@ns/original/ENTIDADE",
+            "CONTA":    "oci://bkt@ns/original/CONTA",
+        },
+        synthetic_path  = "oci://eud-st-blc-engordai-qab-n@gr97zovfhcmu/synthetic",
+        specs_config    = specs_config,
+        original_format = "parquet",
+        synthetic_format= "parquet",
+    )
+
+Espera-se o layout synthetic_path/<TABELA>/part-*.parquet (uma "pasta" por
+tabela), igual ao que o engenheiro gravou via Data Flow.
+
 O que é exibido inline
 -----------------------
 1. Scorecard visual (barras coloridas) — Diagnóstico + Qualidade
@@ -37,10 +57,11 @@ Dependências: pip install sdmetrics matplotlib seaborn
 from __future__ import annotations
 
 import glob
+import io
 import os
 import warnings as _warnings
 _warnings.filterwarnings("ignore", category=FutureWarning, module=r"pandas.*")
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -108,7 +129,7 @@ def _silence():
 # 1. Leitura de tabelas — robusta contra CSV malformado
 # ============================================================
 
-def _read_csv_robust(filepath: str) -> pd.DataFrame:
+def _read_csv_robust(source) -> pd.DataFrame:
     """
     Lê um CSV com fallback automático para os problemas comuns nos arquivos
     do Spark / Oracle / B3:
@@ -121,6 +142,11 @@ def _read_csv_robust(filepath: str) -> pd.DataFrame:
         CSV gerado por ferramentas BR / Excel.
 
     Tenta 5 combinações em cascata; para na primeira que funcionar.
+
+    `source` pode ser:
+    • um caminho local (str) — leitura direta pelo pandas;
+    • bytes/bytearray — conteúdo já baixado (ex.: do OCI Object Storage),
+      reembrulhado em BytesIO a cada tentativa (read_csv consome o buffer).
     """
     attempts = [
         dict(engine="c",      encoding="utf-8-sig", sep=","),
@@ -130,10 +156,12 @@ def _read_csv_robust(filepath: str) -> pd.DataFrame:
         dict(engine="python", encoding="latin-1",   sep=";"),
     ]
     last_exc: Exception = RuntimeError("falha desconhecida")
+    is_bytes = isinstance(source, (bytes, bytearray))
 
     for kw in attempts:
         try:
-            df = pd.read_csv(filepath, on_bad_lines="warn", **kw)
+            src = io.BytesIO(source) if is_bytes else source
+            df = pd.read_csv(src, on_bad_lines="warn", **kw)
             # se resultou em 1 coluna com sep=",", provavelmente o sep real é ";"
             if len(df.columns) == 1 and kw["sep"] == ",":
                 last_exc = ValueError("1 coluna com sep=','; tentando ';'")
@@ -142,17 +170,189 @@ def _read_csv_robust(filepath: str) -> pd.DataFrame:
         except Exception as exc:
             last_exc = exc
 
+    origem = "<bytes>" if is_bytes else f"'{source}'"
     raise RuntimeError(
-        f"Não foi possível ler '{filepath}' após todas as tentativas.\n"
+        f"Não foi possível ler {origem} após todas as tentativas.\n"
         f"Último erro: {last_exc}"
     )
 
 
-def _load_table(path: str, fmt: str) -> pd.DataFrame:
+# ============================================================
+# 1b. Acesso a OCI Object Storage (oci://bucket@namespace/prefix)
+# ============================================================
+
+_OCI_FS = None  # cache do filesystem (login uma vez por sessão)
+
+
+def _is_oci(path: str) -> bool:
+    """True se o caminho é um URI de OCI Object Storage."""
+    return str(path).startswith("oci://")
+
+
+def _get_oci_fs():
+    """
+    Instancia (e memoiza) o OCIFileSystem do ocifs — mesma lib usada no
+    notebook. Só é importado quando um caminho oci:// é realmente usado,
+    então o script continua rodando localmente sem ocifs instalado.
+    """
+    global _OCI_FS
+    if _OCI_FS is None:
+        try:
+            from ocifs import OCIFileSystem
+        except ImportError as exc:
+            raise ImportError(
+                "Caminho oci:// detectado mas o pacote 'ocifs' não está "
+                "instalado. Rode: pip install ocifs"
+            ) from exc
+        # O SDK da OCI/urllib3 emite um FutureWarning sobre o parâmetro
+        # 'strict' ao autenticar. É cosmético (some no urllib3 v3) e
+        # vaza antes do bloco _silence() do report — abafamos aqui.
+        with _warnings.catch_warnings():
+            _warnings.filterwarnings(
+                "ignore", category=FutureWarning, module=r"urllib3.*"
+            )
+            _warnings.filterwarnings(
+                "ignore", message=r".*'strict' parameter.*"
+            )
+            _OCI_FS = OCIFileSystem()
+    return _OCI_FS
+
+
+def _build_oci_uri(
+    bucket: str,
+    namespace: str,
+    prefix: str = "",
+) -> str:
+    """
+    Monta um URI oci:// a partir das partes parametrizáveis.
+
+        bucket    = "qab-n"            (nome do bucket)
+        namespace = "gr97zovfhcmu"     (namespace da tenancy)
+        prefix    = "synthetic"        (pasta-raiz dos dados; opcional)
+        ->  "oci://qab-n@gr97zovfhcmu/synthetic"
+
+    `prefix` pode ter várias camadas ("a/b/c"); barras sobrando são limpas.
+    """
+    uri = f"oci://{bucket}@{namespace}"
+    prefix = str(prefix or "").strip("/")
+    if prefix:
+        uri += "/" + prefix
+    return uri
+
+
+def _join_path(base: str, child: str) -> str:
+    """
+    Junta base + tabela respeitando o esquema. Para oci:// é só concatenação
+    com '/' (NUNCA os.path.join/expanduser, que destroem 'oci://').
+    """
+    if _is_oci(base):
+        return base.rstrip("/") + "/" + str(child).lstrip("/")
+    return os.path.join(os.path.expanduser(str(base).rstrip("/")), str(child))
+
+
+def _load_table_oci(
+    path: str,
+    fmt: str,
+    max_rows: Optional[int] = None,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """
+    Lê uma tabela do OCI Object Storage. Aceita:
+    • prefixo de pasta com part-files do Spark
+      (oci://bkt@ns/synthetic/<TABELA>/part-*.parquet);
+    • caminho direto para um único arquivo.
+
+    Estratégia (espelha o padrão do notebook: fs.find + filtro por extensão):
+    lista os objetos sob o prefixo, baixa cada part via fs.cat_file e
+    concatena. cat_file devolve bytes → BytesIO seekable, que pyarrow e o
+    leitor de CSV consomem sem problema.
+    """
+    fs   = _get_oci_fs()
+    fmt  = (fmt or "csv").lower()
+    path = str(path).rstrip("/")
+
+    try:
+        encontrados = fs.find(path)
+    except FileNotFoundError:
+        encontrados = []
+
+    ext = ".parquet" if fmt == "parquet" else ".csv"
+    parts = [f for f in encontrados if f.lower().endswith(ext)]
+
+    # fallback CSV: part-files do Spark sem extensão .csv explícita
+    if not parts and fmt != "parquet":
+        parts = [
+            f for f in encontrados
+            if os.path.basename(f).startswith("part-")
+        ]
+
+    # fallback: o próprio path já é um arquivo único
+    if not parts:
+        if path.lower().endswith(ext) or fs.isfile(path):
+            parts = [path]
+
+    if not parts:
+        raise FileNotFoundError(
+            f"Nenhum arquivo .{fmt} encontrado em: {path}\n"
+            f"Objetos vistos sob o prefixo: {encontrados[:5]}"
+            + (" ..." if len(encontrados) > 5 else "")
+        )
+
+    dfs: List[pd.DataFrame] = []
+    acumulado = 0
+    with _warnings.catch_warnings():
+        _warnings.filterwarnings(
+            "ignore", category=FutureWarning, module=r"urllib3.*"
+        )
+        _warnings.filterwarnings(
+            "ignore", message=r".*'strict' parameter.*"
+        )
+        for f in sorted(parts):
+            data = fs.cat_file(f)  # bytes do part-file
+            if fmt == "parquet":
+                df_part = pd.read_parquet(io.BytesIO(data))
+            else:
+                df_part = _read_csv_robust(data)
+            del data  # libera os bytes assim que vira DataFrame
+
+            # Amostragem incremental: nunca acumula a tabela inteira em
+            # memória. Para cada part, pega só o que ainda falta para
+            # atingir max_rows e PARA de baixar os próximos parts.
+            if max_rows:
+                falta = max_rows - acumulado
+                if falta <= 0:
+                    break
+                if len(df_part) > falta:
+                    df_part = df_part.sample(n=falta, random_state=seed)
+            dfs.append(df_part)
+            acumulado += len(df_part)
+            if max_rows and acumulado >= max_rows:
+                break
+
+    if not dfs:
+        raise RuntimeError(f"Nenhum dado lido de: {path}")
+    return pd.concat(dfs, ignore_index=True) if len(dfs) > 1 else dfs[0]
+
+
+def _load_table(
+    path: str,
+    fmt: str,
+    max_rows: Optional[int] = None,
+    seed: int = 42,
+) -> pd.DataFrame:
     """
     Lê arquivo único OU pasta de part-files do Spark
     (save_path/<TABELA>/part-*.csv ou *.parquet).
+
+    Detecta automaticamente caminhos oci:// e usa o OCIFileSystem;
+    caso contrário, lê do filesystem local.
+
+    Se max_rows for informado e o caminho for oci://, a amostragem é feita
+    DURANTE a leitura (early-stop por part-file) para não estourar memória.
     """
+    if _is_oci(path):
+        return _load_table_oci(path, fmt, max_rows=max_rows, seed=seed)
+
     fmt  = (fmt or "csv").lower()
     path = os.path.expanduser(str(path).rstrip("/"))
 
@@ -187,7 +387,9 @@ def _load_all(
 ) -> Dict[str, pd.DataFrame]:
     out: Dict[str, pd.DataFrame] = {}
     for name, p in paths.items():
-        df = _load_table(p, fmt)
+        df = _load_table(p, fmt, max_rows=max_rows, seed=seed)
+        # OCI já amostrou na leitura; este sample cobre o caso local
+        # (ou um part-file único maior que max_rows).
         if max_rows and len(df) > max_rows:
             df = df.sample(n=max_rows, random_state=seed).reset_index(drop=True)
         out[name] = df
@@ -663,12 +865,15 @@ def _dist_plots(
 
 def run_comparison_report(
     *,
-    original_table_paths: Mapping[str, str],
-    synthetic_path: str,
+    original_table_paths: "Union[str, Mapping[str, str]]",
+    synthetic_path: Optional[str] = None,
     specs_config: Mapping[str, Mapping],
     original_format: str = "csv",
     synthetic_format: str = "csv",
-    max_rows: Optional[int] = None,
+    oci_bucket: Optional[str] = None,
+    oci_namespace: Optional[str] = None,
+    synthetic_prefix: Optional[str] = None,
+    max_rows: Optional[int] = 50_000,
     show_distribution_plots: bool = True,
     verbose: bool = False,
 ) -> Dict[str, Any]:
@@ -677,16 +882,36 @@ def run_comparison_report(
 
     Parâmetros
     ----------
-    original_table_paths    : mesmo dict de paths usado na síntese
-    synthetic_path          : mesmo save_path da síntese
-                              (espera synthetic_path/<TABELA>/ por tabela)
+    original_table_paths    : dict {tabela: caminho} OU string com o prefixo
+                              base (ex.: "oci://bkt@ns/onprem-export"). Sendo
+                              string, monta prefixo/<TABELA> para cada tabela
+                              do specs_config. Local ou oci://.
+    synthetic_path          : base do sintético (synthetic_path/<TABELA>/).
+                              Local OU oci://. Opcional se você informar
+                              oci_bucket + oci_namespace + synthetic_prefix.
     specs_config            : mesmo specs_config da síntese (PKs e FKs)
     original_format         : "csv" ou "parquet"
     synthetic_format        : "csv" ou "parquet" (= save_format da síntese)
-    max_rows                : amostra cada tabela para acelerar métricas
-                              (recomendado para tabelas com milhões de linhas)
+    oci_bucket              : nome do bucket (ex.: "qab-n"). Use com
+                              oci_namespace + synthetic_prefix para montar
+                              o URI sem passar synthetic_path manualmente.
+    oci_namespace           : namespace da tenancy (ex.: "gr97zovfhcmu")
+    synthetic_prefix        : prefixo/pasta-raiz do sintético no bucket
+                              (ex.: "synthetic" ou "qab/run42/synthetic")
+    max_rows                : amostra cada tabela para acelerar métricas e
+                              CABER EM MEMÓRIA. Padrão 50.000 por tabela.
+                              No OCI a amostragem é feita durante a leitura
+                              (early-stop por part-file), evitando o OOM de
+                              materializar 100k+ linhas de várias tabelas.
+                              Use None para carregar tudo (cuidado com RAM).
     show_distribution_plots : exibe gráficos original vs sintético por coluna
     verbose                 : passa verbose para o SDMetrics
+
+    Resolução do caminho sintético
+    ------------------------------
+    Se oci_bucket E oci_namespace forem informados, o URI é montado como
+    oci://{oci_bucket}@{oci_namespace}/{synthetic_prefix} e tem prioridade.
+    Caso contrário, usa-se synthetic_path como veio. Um dos dois é obrigatório.
 
     Retorna
     -------
@@ -694,6 +919,41 @@ def run_comparison_report(
               quality_report, pk_report, fk_report, resumo_tabelas
     """
     from IPython.display import display, Markdown
+
+    # ── 0. resolver base do sintético (URI parametrizável) ───
+    if oci_bucket and oci_namespace:
+        synthetic_path = _build_oci_uri(
+            oci_bucket, oci_namespace, synthetic_prefix or ""
+        )
+    if not synthetic_path:
+        raise ValueError(
+            "Informe synthetic_path OU (oci_bucket + oci_namespace "
+            "[+ synthetic_prefix]) para localizar o sintético."
+        )
+
+    # ── 0b. normalizar original_table_paths ──────────────────
+    # Aceita duas formas:
+    #   • dict {tabela: caminho_completo}  -> usado como veio;
+    #   • str  "prefixo/base"              -> monta prefixo/<TABELA> para cada
+    #                                          tabela do specs_config.
+    # As tabelas a avaliar saem SEMPRE das chaves do specs_config, garantindo
+    # que original e sintético casem com o mesmo conjunto e nomes.
+    tabelas = list(specs_config.keys())
+    if not tabelas:
+        raise ValueError("`specs_config` está vazio: não há tabelas para avaliar.")
+
+    if isinstance(original_table_paths, str):
+        original_base = original_table_paths
+        original_table_paths = {
+            t: _join_path(original_base, t) for t in tabelas
+        }
+    elif isinstance(original_table_paths, Mapping):
+        original_table_paths = dict(original_table_paths)
+    else:
+        raise TypeError(
+            "`original_table_paths` deve ser um dict {tabela: caminho} OU uma "
+            "string com o prefixo base (ex.: 'oci://bkt@ns/onprem-export')."
+        )
 
     def _sec(titulo: str, emoji: str = ""):
         display(Markdown(f"---\n### {emoji} {titulo}"))
@@ -708,8 +968,8 @@ def run_comparison_report(
 
     print("Lendo dados sintéticos...")
     synth_paths = {
-        t: os.path.join(os.path.expanduser(synthetic_path.rstrip("/")), t)
-        for t in original_table_paths
+        t: _join_path(synthetic_path, t)
+        for t in tabelas
     }
     synth = _load_all(
         synth_paths, synthetic_format,
@@ -719,6 +979,18 @@ def run_comparison_report(
     with _silence():
         real, synth = _align_tables(real, synth)
         metadata    = build_sdmetrics_metadata(real, specs_config)
+
+    # aviso sobre o efeito do sample na integridade referencial
+    if max_rows:
+        display(Markdown(
+            f"> ⚠️ **Amostragem ativa: {max_rows:,} linhas por tabela** "
+            "(para caber em memória). As métricas estatísticas (Column Shapes, "
+            "Pair Trends) permanecem representativas, mas as **métricas de FK "
+            "podem aparecer artificialmente baixas**: amostrar cada tabela de "
+            "forma independente orfana relacionamentos que existem no dado "
+            "completo. Para auditar integridade referencial de verdade, rode "
+            "com `max_rows=None` ou faça subsetting referencialmente coerente."
+        ))
 
     # ── 2. volumes ───────────────────────────────────────────
     _sec("Volumes por tabela", "📋")

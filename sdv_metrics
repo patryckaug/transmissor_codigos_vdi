@@ -51,6 +51,18 @@ O que é exibido inline
 8. Gráficos de distribuição Original vs Sintético por tabela
 9. Resumo de uma linha no final
 
+Robustez (nesta versão)
+-----------------------
+• Se o SDMetrics lançar exceção, o ERRO COMPLETO é exibido inline (não fica
+  mais escondido num print). O scorecard aponta para o bloco de diagnóstico.
+• A metadata de relacionamentos é validada e só inclui vínculos consistentes
+  (a coluna-pai precisa estar declarada como primary_key da tabela-pai), o
+  que evita o erro de validação que derrubava AMBOS os reports de uma vez.
+• Se ainda assim o cálculo falhar com relacionamentos, há um FALLBACK que
+  recalcula só com as tabelas (sem relationships), preservando Column Shapes,
+  Data Validity e Data Structure. A integridade referencial continua coberta
+  pela checagem direta de FK.
+
 Dependências: pip install sdmetrics matplotlib seaborn
 """
 
@@ -59,6 +71,7 @@ from __future__ import annotations
 import glob
 import io
 import os
+import traceback
 import warnings as _warnings
 _warnings.filterwarnings("ignore", category=FutureWarning, module=r"pandas.*")
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
@@ -497,6 +510,14 @@ def build_sdmetrics_metadata(
     """
     Converte specs_config no formato de metadata multi-tabela do SDMetrics.
     FKs compostas são ignoradas aqui (cobertas pela checagem direta).
+
+    IMPORTANTE (correção): um relacionamento só é incluído quando a coluna-pai
+    (`parent_columns`) está realmente declarada como `primary_key` ÚNICA da
+    tabela-pai. O SDMetrics valida a metadata e REJEITA — derrubando os DOIS
+    reports — qualquer relationship cujo `parent_primary_key` não bata com a
+    primary_key declarada da tabela (caso típico: FK simples apontando para
+    uma tabela de PK composta). Esses vínculos inconsistentes continuam
+    auditados na checagem direta de FK; só não entram na metadata do SDMetrics.
     """
     meta: Dict[str, Any] = {"tables": {}, "relationships": []}
     key_cols: Dict[str, set] = {}
@@ -508,6 +529,9 @@ def build_sdmetrics_metadata(
             fks.update(_normalize_cols_cfg(fk.get("columns")))
         key_cols[t] = pks | fks
 
+    # primary_key declarada (única) por tabela, para validar os relacionamentos
+    declared_pk: Dict[str, Optional[str]] = {}
+
     for t, df in real.items():
         cfg  = specs_config.get(t, {})
         pks  = _normalize_cols_cfg(cfg.get("pk_cols"))
@@ -518,6 +542,9 @@ def build_sdmetrics_metadata(
         tmeta: Dict[str, Any] = {"columns": cols}
         if len(pks) == 1 and pks[0] in df.columns:
             tmeta["primary_key"] = pks[0]
+            declared_pk[t] = pks[0]
+        else:
+            declared_pk[t] = None
         meta["tables"][t] = tmeta
 
     for t, cfg in specs_config.items():
@@ -530,6 +557,15 @@ def build_sdmetrics_metadata(
             if not ptab or ptab not in real:
                 continue
             if len(cols) != 1 or len(pcols) != 1:
+                continue  # FK composta: tratada só na checagem direta
+            # A coluna-pai PRECISA ser a primary_key única declarada do pai,
+            # senão o SDMetrics rejeita a metadata inteira.
+            if declared_pk.get(ptab) != pcols[0]:
+                continue
+            # As colunas precisam existir de fato nas duas tabelas.
+            if cols[0] not in meta["tables"].get(t, {}).get("columns", {}):
+                continue
+            if pcols[0] not in meta["tables"].get(ptab, {}).get("columns", {}):
                 continue
             meta["relationships"].append({
                 "parent_table_name":  ptab,
@@ -539,6 +575,128 @@ def build_sdmetrics_metadata(
             })
 
     return meta
+
+
+# ============================================================
+# 3b. Validação / robustez da geração SDMetrics
+# ============================================================
+
+def _strip_relationships(meta: Mapping[str, Any]) -> Dict[str, Any]:
+    """Cópia da metadata SEM relacionamentos (fallback quando o cálculo de
+    relacionamento quebra a geração)."""
+    return {"tables": dict(meta.get("tables", {})), "relationships": []}
+
+
+def _preflight_metadata(
+    real:  Dict[str, pd.DataFrame],
+    synth: Dict[str, pd.DataFrame],
+    specs_config: Mapping[str, Mapping],
+    metadata: Mapping[str, Any],
+) -> List[str]:
+    """
+    Verificações baratas ANTES de chamar o SDMetrics. Retorna uma lista de
+    problemas em linguagem clara — vazia se estiver tudo certo. Cobre as
+    causas mais comuns de n/d:
+      • nenhuma tabela carregada / nenhuma em comum (divergência de casing);
+      • tabela vazia ou sem colunas em comum;
+      • metadata sem tabelas;
+      • relacionamento referenciando coluna que não é a primary_key do pai.
+    """
+    problemas: List[str] = []
+
+    if not real:
+        problemas.append("Nenhuma tabela ORIGINAL foi carregada.")
+    if not synth:
+        problemas.append("Nenhuma tabela SINTÉTICA foi carregada.")
+
+    comuns = sorted(set(real) & set(synth))
+    if real and synth and not comuns:
+        problemas.append(
+            "Nenhuma tabela em comum entre original e sintético — provável "
+            f"divergência de NOME/CASING. Original={sorted(real)} vs "
+            f"Sintético={sorted(synth)}."
+        )
+
+    for t in comuns:
+        if len(real.get(t, [])) == 0:
+            problemas.append(f"Tabela '{t}' (original) está vazia.")
+        if len(synth.get(t, [])) == 0:
+            problemas.append(f"Tabela '{t}' (sintético) está vazia.")
+        if t in real and len(real[t].columns) == 0:
+            problemas.append(f"Tabela '{t}' não tem colunas em comum entre original e sintético.")
+
+    if not metadata.get("tables"):
+        problemas.append(
+            "Metadata do SDMetrics ficou sem tabelas — generate() iria falhar. "
+            "Verifique se os nomes em specs_config batem com os dados carregados."
+        )
+
+    tabs = metadata.get("tables", {})
+    for rel in metadata.get("relationships", []):
+        pt, ppk = rel["parent_table_name"], rel["parent_primary_key"]
+        ct, cfk = rel["child_table_name"],  rel["child_foreign_key"]
+        tdef = tabs.get(pt, {})
+        if tdef.get("primary_key") != ppk:
+            problemas.append(
+                f"Relacionamento {ct}.{cfk} → {pt}.{ppk}: '{ppk}' não está "
+                f"declarada como primary_key de '{pt}' (PK atual: "
+                f"{tdef.get('primary_key')!r})."
+            )
+        if cfk not in tabs.get(ct, {}).get("columns", {}):
+            problemas.append(f"FK '{cfk}' não existe nas colunas de '{ct}'.")
+        if ppk not in tdef.get("columns", {}):
+            problemas.append(f"PK '{ppk}' não existe nas colunas de '{pt}'.")
+
+    return problemas
+
+
+def _try_report(
+    report_cls,
+    real:  Dict[str, pd.DataFrame],
+    synth: Dict[str, pd.DataFrame],
+    metadata: Mapping[str, Any],
+    verbose: bool,
+) -> Tuple[Any, Optional[float], Optional[pd.DataFrame], Optional[str], bool]:
+    """
+    Gera um report do SDMetrics com tolerância a falha:
+      1ª tentativa: metadata completa (com relacionamentos);
+      2ª tentativa: metadata SEM relacionamentos (fallback).
+
+    Retorna (report, score, properties, traceback_str, usou_fallback).
+    Se ambas as tentativas falharem, retorna (None, None, None, tb, False)
+    com o traceback COMPLETO empilhado para exibição/diagnóstico.
+    """
+    erros: List[str] = []
+    variantes = [(metadata, False), (_strip_relationships(metadata), True)]
+
+    for meta, is_fallback in variantes:
+        # Pula a 2ª tentativa se não havia relacionamento (seria idêntica).
+        if is_fallback and not metadata.get("relationships"):
+            break
+        try:
+            rep = report_cls()
+            rep.generate(real, synth, meta, verbose=verbose)
+            score = float(rep.get_score())
+            props = rep.get_properties()
+            return rep, score, props, ("\n\n".join(erros) or None), is_fallback
+        except Exception:
+            etiqueta = "SEM relacionamentos" if is_fallback else "metadata completa"
+            erros.append(f"[tentativa: {etiqueta}]\n{traceback.format_exc()}")
+
+    return None, None, None, "\n\n".join(erros), False
+
+
+def _last_exc_line(tb: Optional[str]) -> str:
+    """Última linha não-vazia de um traceback (a mensagem da exceção)."""
+    if not tb:
+        return ""
+    linhas = [l for l in tb.strip().splitlines() if l.strip()]
+    return linhas[-1] if linhas else ""
+
+
+def _fence(text: Optional[str]) -> str:
+    """Embrulha texto num bloco de código Markdown."""
+    return "```\n" + (text or "").strip() + "\n```"
 
 
 # ============================================================
@@ -932,7 +1090,8 @@ def run_comparison_report(
     Retorna
     -------
     dict com: diagnostic_score, quality_score, diagnostic_report,
-              quality_report, pk_report, fk_report, resumo_tabelas
+              quality_report, pk_report, fk_report, resumo_tabelas,
+              diagnostic_error, quality_error, preflight_problems
     """
     from IPython.display import display, Markdown
 
@@ -996,6 +1155,9 @@ def run_comparison_report(
         real, synth = _align_tables(real, synth)
         metadata    = build_sdmetrics_metadata(real, specs_config)
 
+    # ── 1b. pré-voo: detecta causas comuns de falha ANTES do cálculo ──
+    preflight_problems = _preflight_metadata(real, synth, specs_config, metadata)
+
     # aviso sobre o efeito do sample na integridade referencial
     if max_rows:
         display(Markdown(
@@ -1010,61 +1172,72 @@ def run_comparison_report(
 
     # ── 2. volumes ───────────────────────────────────────────
     _sec("Volumes por tabela", "📋")
-    vol = pd.DataFrame([
-        {
-            "tabela":            t,
-            "linhas_original":   len(real[t]),
-            "linhas_sintético":  len(synth[t]),
-            "fator_x":           round(len(synth[t]) / max(len(real[t]), 1), 2),
-            "colunas":           len(real[t].columns),
-        }
-        for t in sorted(real)
-    ])
-    display(
-        vol.style
-        .format({"fator_x": "{:.2f}×"})
-        .set_table_styles([
-            {"selector": "th",
-             "props": f"background:{_NAVY};color:white;padding:6px 8px"},
-            {"selector": "td", "props": "padding:5px 8px"},
+    if real:
+        vol = pd.DataFrame([
+            {
+                "tabela":            t,
+                "linhas_original":   len(real[t]),
+                "linhas_sintético":  len(synth[t]),
+                "fator_x":           round(len(synth[t]) / max(len(real[t]), 1), 2),
+                "colunas":           len(real[t].columns),
+            }
+            for t in sorted(real)
         ])
-    )
+        display(
+            vol.style
+            .format({"fator_x": "{:.2f}×"})
+            .set_table_styles([
+                {"selector": "th",
+                 "props": f"background:{_NAVY};color:white;padding:6px 8px"},
+                {"selector": "td", "props": "padding:5px 8px"},
+            ])
+        )
+    else:
+        vol = pd.DataFrame()
+        display(Markdown(
+            "> ❌ **Nenhuma tabela em comum entre original e sintético.** "
+            "Verifique nomes/casing das tabelas e os caminhos. Veja o "
+            "diagnóstico de erros mais abaixo."
+        ))
 
-    # ── 3. métricas SDMetrics ────────────────────────────────
+    # ── 3. métricas SDMetrics (com fallback e erro visível) ──
     print("Calculando métricas SDMetrics (warnings internos suprimidos)...")
     diag_score = qual_score = None
     diag_props = qual_props = shapes_detail = None
     rel_detail = card_detail = None
     diag = qual = None
+    diag_error = qual_error = None
+    diag_fallback = qual_fallback = False
 
-    with _silence():
-        try:
-            diag = DiagnosticReport()
-            diag.generate(real, synth, metadata, verbose=verbose)
-            diag_score = float(diag.get_score())
-            diag_props = diag.get_properties()
-            try:
-                rel_detail = diag.get_details("Relationship Validity")
-            except Exception:
-                pass
-        except Exception as exc:
-            print(f"  ⚠ DiagnosticReport: {exc}")
+    if metadata.get("tables"):
+        with _silence():
+            (diag, diag_score, diag_props,
+             diag_error, diag_fallback) = _try_report(
+                DiagnosticReport, real, synth, metadata, verbose
+            )
+            if diag is not None:
+                try:
+                    rel_detail = diag.get_details("Relationship Validity")
+                except Exception:
+                    pass
 
-        try:
-            qual = QualityReport()
-            qual.generate(real, synth, metadata, verbose=verbose)
-            qual_score = float(qual.get_score())
-            qual_props = qual.get_properties()
-            try:
-                shapes_detail = qual.get_details("Column Shapes")
-            except Exception:
-                pass
-            try:
-                card_detail = qual.get_details("Cardinality")
-            except Exception:
-                pass
-        except Exception as exc:
-            print(f"  ⚠ QualityReport: {exc}")
+            (qual, qual_score, qual_props,
+             qual_error, qual_fallback) = _try_report(
+                QualityReport, real, synth, metadata, verbose
+            )
+            if qual is not None:
+                try:
+                    shapes_detail = qual.get_details("Column Shapes")
+                except Exception:
+                    pass
+                try:
+                    card_detail = qual.get_details("Cardinality")
+                except Exception:
+                    pass
+    else:
+        diag_error = qual_error = (
+            "Metadata sem tabelas — o cálculo do SDMetrics não foi nem tentado."
+        )
 
     # ── 4. integridade direta ────────────────────────────────
     pk_report, fk_report = direct_integrity_checks(synth, specs_config)
@@ -1088,11 +1261,56 @@ def run_comparison_report(
     _scorecard([
         ("Diagnóstico\n(validade + integridade)",
          diag_score,
-         "≥ 90%: PKs únicas · FKs válidas · estrutura preservada"),
+         "≥ 90%: PKs únicas · FKs válidas · estrutura preservada"
+            if diag_score is not None
+            else "⚠ não calculado — ver diagnóstico de erros abaixo"),
         ("Qualidade estatística",
          qual_score,
-         "fidelidade de distribuições · correlações · fan-out"),
+         "fidelidade de distribuições · correlações · fan-out"
+            if qual_score is not None
+            else "⚠ não calculado — ver diagnóstico de erros abaixo"),
     ])
+
+    # ── 5b. diagnóstico de erros (só aparece se algo falhou) ──
+    houve_falha = (
+        diag_score is None or qual_score is None
+        or diag_fallback or qual_fallback or bool(preflight_problems)
+    )
+    if houve_falha:
+        _sec("Diagnóstico de Erros do SDMetrics", "🛠️")
+        display(Markdown(
+            "> Algum cálculo do SDMetrics não rodou como esperado. Abaixo está "
+            "o que foi detectado e o **erro exato** retornado pela biblioteca. "
+            "A checagem direta de PK/FK mais abaixo é independente do SDMetrics "
+            "e continua válida."
+        ))
+
+        if preflight_problems:
+            display(Markdown("**Verificações de pré-voo que falharam:**"))
+            display(Markdown("\n".join(f"- {p}" for p in preflight_problems)))
+
+        if (diag_fallback or qual_fallback):
+            display(Markdown(
+                "> ℹ️ As métricas de **relacionamento** (Relationship Validity / "
+                "Cardinality) foram desabilitadas para conseguir calcular o "
+                "restante (Data Validity, Data Structure, Column Shapes, Pair "
+                "Trends). A integridade referencial continua coberta pela "
+                "checagem direta de FK mais abaixo."
+            ))
+
+        if diag_score is None and diag_error:
+            display(Markdown("**DiagnosticReport — não calculado.** Último erro:"))
+            display(Markdown(f"`{_last_exc_line(diag_error)}`"))
+            display(Markdown("<details><summary>traceback completo</summary>\n\n"
+                             + _fence(diag_error) + "\n\n</details>"))
+            print("\n===== TRACEBACK DiagnosticReport =====\n" + (diag_error or ""))
+
+        if qual_score is None and qual_error:
+            display(Markdown("**QualityReport — não calculado.** Último erro:"))
+            display(Markdown(f"`{_last_exc_line(qual_error)}`"))
+            display(Markdown("<details><summary>traceback completo</summary>\n\n"
+                             + _fence(qual_error) + "\n\n</details>"))
+            print("\n===== TRACEBACK QualityReport =====\n" + (qual_error or ""))
 
     # ── 6. diagnóstico ───────────────────────────────────────
     _sec("Diagnóstico de Integridade", "🔍")
@@ -1112,6 +1330,8 @@ def run_comparison_report(
 """))
     if diag_props is not None:
         display(_style_df(diag_props.round(3), score_col="Score", status_col=None))
+    else:
+        display(Markdown("_Diagnóstico SDMetrics indisponível (ver bloco de erros acima)._"))
 
     if rel_detail is not None and len(rel_detail) > 0:
         display(Markdown(
@@ -1151,6 +1371,8 @@ def run_comparison_report(
 """))
     if qual_props is not None:
         display(_style_df(qual_props.round(3), score_col="Score", status_col=None))
+    else:
+        display(Markdown("_Qualidade SDMetrics indisponível (ver bloco de erros acima)._"))
 
     if card_detail is not None and len(card_detail) > 0:
         display(Markdown(
@@ -1214,7 +1436,7 @@ def run_comparison_report(
         display(Markdown("_Nenhuma FK declarada._"))
 
     # ── 10. distribuições ────────────────────────────────────
-    if show_distribution_plots:
+    if show_distribution_plots and real:
         _sec("Distribuições: Original vs Sintético", "📊")
         display(Markdown(
             "> **O que é?** Compara visualmente a forma da distribuição de cada "
@@ -1233,7 +1455,9 @@ def run_comparison_report(
     display(Markdown("---"))
     falhas_pk = int((pk_report["status"] != "OK").sum()) if len(pk_report) else 0
     falhas_fk = int((fk_report["status"] != "OK").sum()) if len(fk_report) else 0
-    icone     = "✅" if (falhas_pk == 0 and falhas_fk == 0) else "⚠️"
+    sdmetrics_ok = (diag_score is not None and qual_score is not None)
+    icone     = ("✅" if (falhas_pk == 0 and falhas_fk == 0 and sdmetrics_ok)
+                 else "⚠️")
     d_txt     = f"{diag_score * 100:.1f}%" if diag_score is not None else "n/d"
     q_txt     = f"{qual_score * 100:.1f}%" if qual_score is not None else "n/d"
     display(Markdown(
@@ -1245,11 +1469,14 @@ def run_comparison_report(
     ))
 
     return {
-        "diagnostic_score":  diag_score,
-        "quality_score":     qual_score,
-        "diagnostic_report": diag,
-        "quality_report":    qual,
-        "pk_report":         pk_report,
-        "fk_report":         fk_report,
-        "resumo_tabelas":    vol,
+        "diagnostic_score":   diag_score,
+        "quality_score":      qual_score,
+        "diagnostic_report":  diag,
+        "quality_report":     qual,
+        "pk_report":          pk_report,
+        "fk_report":          fk_report,
+        "resumo_tabelas":     vol,
+        "diagnostic_error":   diag_error,
+        "quality_error":      qual_error,
+        "preflight_problems": preflight_problems,
     }

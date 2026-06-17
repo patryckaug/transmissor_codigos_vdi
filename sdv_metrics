@@ -911,45 +911,95 @@ def _fix_relationship_validity(
     diag_props:  Optional[pd.DataFrame],
 ) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[float], bool]:
     """
-    A métrica ReferentialIntegrity do SDMetrics falha com pandas ≥ 2.0 e
-    retorna NaN, derrubando o score do diagnóstico injustamente.
-    Substitui o NaN pelo resultado da checagem direta (que mede o mesmo) e
-    recompõe o score.
+    Garante que a propriedade 'Relationship Validity' do diagnóstico NUNCA
+    fique NaN.
+
+    Causa-raiz: a métrica ReferentialIntegrity do SDMetrics retorna NaN com
+    pandas >= 2.0, e às vezes get_details('Relationship Validity') nem
+    devolve a tabela. O remendo antigo só cobria um caminho (linha NaN de
+    ReferentialIntegrity com chave batendo exatamente), então o NaN ainda
+    vazava quando:
+      • rel_detail vinha None/vazio (a propriedade ficava NaN sem conserto);
+      • a chave (Child, Foreign Key, Parent) não batia com a do fk_report;
+      • o NaN vinha do CardinalityBoundaryAdherence, não do RI.
+
+    Esta versão é robusta a todos esses casos:
+      1. Preenche cada linha NaN de ReferentialIntegrity com a checagem direta
+         de FK, tentando: chave exata -> (filho, pai) -> média geral das FKs.
+      2. Recalcula o score da propriedade a partir do detalhe, IGNORANDO NaN
+         remanescente (ex.: CardinalityBoundaryAdherence que a lib não
+         conseguiu calcular).
+      3. Se o detalhe não existir, calcula a Relationship Validity direto da
+         integridade referencial média das FKs.
+      4. Aplica o valor sempre que a propriedade estiver NaN (ou tiver sido
+         recomposta) e recompõe o score geral do diagnóstico (ignorando NaN).
+
+    Retorna (rel_detail, diag_props, novo_diag_score, ajustou).
     """
-    if rel_detail is None or len(rel_detail) == 0:
-        return rel_detail, diag_props, None, False
+    # ---- referência direta (verdade independente do SDMetrics) ----
+    direct_ri_mean: Optional[float] = None
+    exact: Dict[Tuple[str, str, str], float] = {}
+    by_child_parent: Dict[Tuple[str, str], List[float]] = {}
+    if fk_report is not None and len(fk_report):
+        vals = pd.to_numeric(fk_report["%_validas"], errors="coerce") / 100.0
+        if vals.notna().any():
+            direct_ri_mean = float(vals.mean())
+        for _, r in fk_report.iterrows():
+            v = float(r["%_validas"]) / 100.0
+            exact[(r["tabela_filha"], r["fk"], r["tabela_pai"])] = v
+            by_child_parent.setdefault((r["tabela_filha"], r["tabela_pai"]), []).append(v)
 
-    rel      = rel_detail.copy()
-    ajustou  = False
-    fk_lkp   = {
-        (r["tabela_filha"], r["fk"], r["tabela_pai"]): r["%_validas"] / 100.0
-        for _, r in fk_report.iterrows()
-    }
+    ajustou = False
+    rel = rel_detail.copy() if rel_detail is not None else None
 
-    for idx, row in rel.iterrows():
-        if row.get("Metric") != "ReferentialIntegrity":
-            continue
-        if pd.notna(row.get("Score")):
-            continue
-        key = (row["Child Table"], row["Foreign Key"], row["Parent Table"])
-        if key in fk_lkp:
-            rel.at[idx, "Score"] = fk_lkp[key]
-            if "Error" in rel.columns:
-                rel.at[idx, "Error"] = "bug lib; preenchido pela checagem direta"
-            ajustou = True
+    # ---- 1+2: corrige o detalhe e recompõe a propriedade a partir dele ----
+    rv_from_detail: Optional[float] = None
+    if rel is not None and len(rel) and "Score" in rel.columns:
+        for idx, row in rel.iterrows():
+            if row.get("Metric") != "ReferentialIntegrity":
+                continue
+            if pd.notna(row.get("Score")):
+                continue
+            child  = row.get("Child Table")
+            parent = row.get("Parent Table")
+            fkname = row.get("Foreign Key")
+            val: Optional[float] = None
+            if (child, fkname, parent) in exact:
+                val = exact[(child, fkname, parent)]
+            elif (child, parent) in by_child_parent:
+                vs  = by_child_parent[(child, parent)]
+                val = sum(vs) / len(vs)
+            elif direct_ri_mean is not None:
+                val = direct_ri_mean
+            if val is not None:
+                rel.at[idx, "Score"] = val
+                if "Error" in rel.columns:
+                    rel.at[idx, "Error"] = "bug lib; preenchido pela checagem direta"
+                ajustou = True
+        scores = pd.to_numeric(rel["Score"], errors="coerce")
+        if scores.notna().any():
+            rv_from_detail = float(scores.mean())
 
-    if not ajustou:
-        return rel, diag_props, None, False
+    # ---- 3: sem detalhe utilizável -> usa integridade referencial direta ----
+    rv_score = rv_from_detail if rv_from_detail is not None else direct_ri_mean
 
-    rel_score  = float(rel["Score"].mean())
-    props      = diag_props.copy() if diag_props is not None else None
-    novo_diag  = None
+    # ---- 4: aplica na propriedade (se NaN ou recomposta) e recompõe geral ----
+    props     = diag_props.copy() if diag_props is not None else None
+    novo_diag: Optional[float] = None
+    if (props is not None and "Property" in props.columns
+            and "Score" in props.columns):
+        mask = props["Property"] == "Relationship Validity"
+        if mask.any() and rv_score is not None:
+            atual = pd.to_numeric(props.loc[mask, "Score"], errors="coerce")
+            precisa = bool(atual.isna().any()) or ajustou or (rv_from_detail is not None)
+            if precisa:
+                props.loc[mask, "Score"] = rv_score
+                ajustou = True
+        todos = pd.to_numeric(props["Score"], errors="coerce")
+        if todos.notna().any():
+            novo_diag = float(todos.mean())
 
-    if props is not None and "Property" in props.columns:
-        props.loc[props["Property"] == "Relationship Validity", "Score"] = rel_score
-        novo_diag = float(props["Score"].mean())
-
-    return rel, props, novo_diag, True
+    return (rel if rel is not None else rel_detail), props, novo_diag, ajustou
 
 
 # ============================================================
@@ -1375,14 +1425,17 @@ def run_comparison_report(
     pk_report, fk_report = direct_integrity_checks(synth, specs_config)
     timings["integridade_direta"] = time.perf_counter() - _t0
 
-    # corrige bug ReferentialIntegrity
+    # corrige bug ReferentialIntegrity (Relationship Validity NaN)
     rel_detail, diag_props_fix, diag_score_fix, rel_ajustado = (
         _fix_relationship_validity(rel_detail, fk_report, diag_props)
     )
-    if rel_ajustado:
+    if rel_ajustado and diag_props_fix is not None:
         diag_props = diag_props_fix
-        if diag_score_fix is not None:
-            diag_score = diag_score_fix
+    _diag_eh_nan = isinstance(diag_score, float) and np.isnan(diag_score)
+    if diag_score_fix is not None and (
+        rel_ajustado or diag_score is None or _diag_eh_nan
+    ):
+        diag_score = diag_score_fix
 
     # ── 5. scorecard ─────────────────────────────────────────
     _sec("Visão Geral", "🎯")

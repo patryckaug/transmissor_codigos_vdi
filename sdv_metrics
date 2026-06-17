@@ -158,10 +158,26 @@ def _read_csv_robust(source) -> pd.DataFrame:
     last_exc: Exception = RuntimeError("falha desconhecida")
     is_bytes = isinstance(source, (bytes, bytearray))
 
+    # Blindagem: se "CSV" começa com o magic number do Parquet (PAR1), é
+    # quase certo que o formato foi declarado errado (ex.: original_format=
+    # "csv" quando os dados são parquet). Parsear isso como texto geraria
+    # milhares de "Skipping line ..." e congelaria o notebook. Aborta cedo.
+    if is_bytes:
+        head = bytes(source[:4])
+        if head[:4] == b"PAR1":
+            raise ValueError(
+                "Os bytes parecem ser PARQUET (magic 'PAR1'), mas a leitura foi "
+                "solicitada como CSV. Passe o formato correto — provavelmente "
+                "falta `original_format='parquet'` (ou `synthetic_format`)."
+            )
+
     for kw in attempts:
         try:
             src = io.BytesIO(source) if is_bytes else source
-            df = pd.read_csv(src, on_bad_lines="warn", **kw)
+            # on_bad_lines="skip": pula linhas problemáticas SEM emitir um
+            # warning por linha (o "warn" antigo gerava ruído infinito em
+            # arquivos grandes ou formato errado).
+            df = pd.read_csv(src, on_bad_lines="skip", **kw)
             # se resultou em 1 coluna com sep=",", provavelmente o sep real é ";"
             if len(df.columns) == 1 and kw["sep"] == ",":
                 last_exc = ValueError("1 coluna com sep=','; tentando ';'")

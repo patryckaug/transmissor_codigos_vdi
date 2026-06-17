@@ -204,7 +204,17 @@ def _get_oci_fs():
                 "Caminho oci:// detectado mas o pacote 'ocifs' não está "
                 "instalado. Rode: pip install ocifs"
             ) from exc
-        _OCI_FS = OCIFileSystem()
+        # O SDK da OCI/urllib3 emite um FutureWarning sobre o parâmetro
+        # 'strict' ao autenticar. É cosmético (some no urllib3 v3) e
+        # vaza antes do bloco _silence() do report — abafamos aqui.
+        with _warnings.catch_warnings():
+            _warnings.filterwarnings(
+                "ignore", category=FutureWarning, module=r"urllib3.*"
+            )
+            _warnings.filterwarnings(
+                "ignore", message=r".*'strict' parameter.*"
+            )
+            _OCI_FS = OCIFileSystem()
     return _OCI_FS
 
 
@@ -240,7 +250,12 @@ def _join_path(base: str, child: str) -> str:
     return os.path.join(os.path.expanduser(str(base).rstrip("/")), str(child))
 
 
-def _load_table_oci(path: str, fmt: str) -> pd.DataFrame:
+def _load_table_oci(
+    path: str,
+    fmt: str,
+    max_rows: Optional[int] = None,
+    seed: int = 42,
+) -> pd.DataFrame:
     """
     Lê uma tabela do OCI Object Storage. Aceita:
     • prefixo de pasta com part-files do Spark
@@ -284,26 +299,59 @@ def _load_table_oci(path: str, fmt: str) -> pd.DataFrame:
         )
 
     dfs: List[pd.DataFrame] = []
-    for f in sorted(parts):
-        data = fs.cat_file(f)  # bytes
-        if fmt == "parquet":
-            dfs.append(pd.read_parquet(io.BytesIO(data)))
-        else:
-            dfs.append(_read_csv_robust(data))
+    acumulado = 0
+    with _warnings.catch_warnings():
+        _warnings.filterwarnings(
+            "ignore", category=FutureWarning, module=r"urllib3.*"
+        )
+        _warnings.filterwarnings(
+            "ignore", message=r".*'strict' parameter.*"
+        )
+        for f in sorted(parts):
+            data = fs.cat_file(f)  # bytes do part-file
+            if fmt == "parquet":
+                df_part = pd.read_parquet(io.BytesIO(data))
+            else:
+                df_part = _read_csv_robust(data)
+            del data  # libera os bytes assim que vira DataFrame
 
+            # Amostragem incremental: nunca acumula a tabela inteira em
+            # memória. Para cada part, pega só o que ainda falta para
+            # atingir max_rows e PARA de baixar os próximos parts.
+            if max_rows:
+                falta = max_rows - acumulado
+                if falta <= 0:
+                    break
+                if len(df_part) > falta:
+                    df_part = df_part.sample(n=falta, random_state=seed)
+            dfs.append(df_part)
+            acumulado += len(df_part)
+            if max_rows and acumulado >= max_rows:
+                break
+
+    if not dfs:
+        raise RuntimeError(f"Nenhum dado lido de: {path}")
     return pd.concat(dfs, ignore_index=True) if len(dfs) > 1 else dfs[0]
 
 
-def _load_table(path: str, fmt: str) -> pd.DataFrame:
+def _load_table(
+    path: str,
+    fmt: str,
+    max_rows: Optional[int] = None,
+    seed: int = 42,
+) -> pd.DataFrame:
     """
     Lê arquivo único OU pasta de part-files do Spark
     (save_path/<TABELA>/part-*.csv ou *.parquet).
 
     Detecta automaticamente caminhos oci:// e usa o OCIFileSystem;
     caso contrário, lê do filesystem local.
+
+    Se max_rows for informado e o caminho for oci://, a amostragem é feita
+    DURANTE a leitura (early-stop por part-file) para não estourar memória.
     """
     if _is_oci(path):
-        return _load_table_oci(path, fmt)
+        return _load_table_oci(path, fmt, max_rows=max_rows, seed=seed)
 
     fmt  = (fmt or "csv").lower()
     path = os.path.expanduser(str(path).rstrip("/"))
@@ -339,7 +387,9 @@ def _load_all(
 ) -> Dict[str, pd.DataFrame]:
     out: Dict[str, pd.DataFrame] = {}
     for name, p in paths.items():
-        df = _load_table(p, fmt)
+        df = _load_table(p, fmt, max_rows=max_rows, seed=seed)
+        # OCI já amostrou na leitura; este sample cobre o caso local
+        # (ou um part-file único maior que max_rows).
         if max_rows and len(df) > max_rows:
             df = df.sample(n=max_rows, random_state=seed).reset_index(drop=True)
         out[name] = df
@@ -823,7 +873,7 @@ def run_comparison_report(
     oci_bucket: Optional[str] = None,
     oci_namespace: Optional[str] = None,
     synthetic_prefix: Optional[str] = None,
-    max_rows: Optional[int] = None,
+    max_rows: Optional[int] = 50_000,
     show_distribution_plots: bool = True,
     verbose: bool = False,
 ) -> Dict[str, Any]:
@@ -846,8 +896,12 @@ def run_comparison_report(
     oci_namespace           : namespace da tenancy (ex.: "gr97zovfhcmu")
     synthetic_prefix        : prefixo/pasta-raiz do sintético no bucket
                               (ex.: "synthetic" ou "qab/run42/synthetic")
-    max_rows                : amostra cada tabela para acelerar métricas
-                              (recomendado para tabelas com milhões de linhas)
+    max_rows                : amostra cada tabela para acelerar métricas e
+                              CABER EM MEMÓRIA. Padrão 50.000 por tabela.
+                              No OCI a amostragem é feita durante a leitura
+                              (early-stop por part-file), evitando o OOM de
+                              materializar 100k+ linhas de várias tabelas.
+                              Use None para carregar tudo (cuidado com RAM).
     show_distribution_plots : exibe gráficos original vs sintético por coluna
     verbose                 : passa verbose para o SDMetrics
 
@@ -899,6 +953,18 @@ def run_comparison_report(
     with _silence():
         real, synth = _align_tables(real, synth)
         metadata    = build_sdmetrics_metadata(real, specs_config)
+
+    # aviso sobre o efeito do sample na integridade referencial
+    if max_rows:
+        display(Markdown(
+            f"> ⚠️ **Amostragem ativa: {max_rows:,} linhas por tabela** "
+            "(para caber em memória). As métricas estatísticas (Column Shapes, "
+            "Pair Trends) permanecem representativas, mas as **métricas de FK "
+            "podem aparecer artificialmente baixas**: amostrar cada tabela de "
+            "forma independente orfana relacionamentos que existem no dado "
+            "completo. Para auditar integridade referencial de verdade, rode "
+            "com `max_rows=None` ou faça subsetting referencialmente coerente."
+        ))
 
     # ── 2. volumes ───────────────────────────────────────────
     _sec("Volumes por tabela", "📋")
@@ -1145,23 +1211,3 @@ def run_comparison_report(
         "fk_report":         fk_report,
         "resumo_tabelas":    vol,
     }
-
-
-# A) parametrizado por partes
-run_comparison_report(
-    original_table_paths = {"BLOQUEIO_OPERACAO_IF": "oci://qab-n@gr97zovfhcmu/original/BLOQUEIO_OPERACAO_IF", ...},
-    oci_bucket       = "qab-n",
-    oci_namespace    = "gr97zovfhcmu",
-    synthetic_prefix = "synthetic",
-    specs_config     = specs_config,
-    original_format  = "parquet",
-    synthetic_format = "parquet",
-)
-
-# B) URI direto (como antes)
-run_comparison_report(
-    original_table_paths = {...},
-    synthetic_path   = "oci://qab-n@gr97zovfhcmu/synthetic",
-    specs_config     = specs_config,
-    synthetic_format = "parquet",
-)

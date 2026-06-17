@@ -850,7 +850,10 @@ def direct_integrity_checks(
                 .copy()
                 .reset_index(drop=True)
             )
-            total = len(filhos_df)
+            total      = len(filhos_df)          # filhos com FK preenchida
+            linhas_tab = len(df)                 # total de filhos na tabela
+            fk_nulas   = linhas_tab - total      # filhos com FK nula (órfãos)
+            pct_nulas  = round(100.0 * fk_nulas / linhas_tab, 2) if linhas_tab else 0.0
 
             if total == 0:
                 invalidas, pct = 0, 100.0
@@ -886,6 +889,9 @@ def direct_integrity_checks(
                 "tabela_filha":  t,
                 "fk":            ",".join(cols),
                 "tabela_pai":    ptab,
+                "linhas":        linhas_tab,
+                "fk_nula":       fk_nulas,
+                "%_nula":        pct_nulas,
                 "total_fk":      total,
                 "invalidas":     invalidas,
                 "%_validas":     round(pct, 2),
@@ -1292,7 +1298,7 @@ def run_comparison_report(
     # ── 3. métricas SDMetrics (gating + timing + fallback) ──
     diag_score = qual_score = None
     diag_props = qual_props = shapes_detail = None
-    rel_detail = card_detail = None
+    rel_detail = card_detail = intertable_detail = None
     diag = qual = None
     diag_error = qual_error = None
     diag_fallback = qual_fallback = False
@@ -1351,6 +1357,13 @@ def run_comparison_report(
                             pass
                         try:
                             card_detail = qual.get_details("Cardinality")
+                        except Exception:
+                            pass
+                        # Intertable Trends: correlações que cruzam o vínculo
+                        # pai→filho. Nem toda versão do SDMetrics calcula —
+                        # por isso o try/except silencioso.
+                        try:
+                            intertable_detail = qual.get_details("Intertable Trends")
                         except Exception:
                             pass
             timings["quality"] = time.perf_counter() - _t0
@@ -1512,6 +1525,17 @@ def run_comparison_report(
         ))
         display(_style_df(card_detail.round(3), score_col="Score", status_col=None))
 
+    if intertable_detail is not None and len(intertable_detail) > 0:
+        display(Markdown(
+            "**Tendências entre tabelas (Intertable Trends)** — mede se as "
+            "correlações de VALORES que cruzam o vínculo pai→filho foram "
+            "preservadas (ex.: o segmento da ENTIDADE ainda prediz o saldo da "
+            "CONTA?). O Column Pair Trends **não** cobre isto — ele só olha "
+            "pares de colunas dentro da mesma tabela. Score alto = a relação de "
+            "valores entre tabelas continua realista."
+        ))
+        display(_style_df(intertable_detail.round(3), score_col="Score", status_col=None))
+
     if shapes_detail is not None and "Score" in shapes_detail.columns:
         piores = shapes_detail.sort_values("Score").head(10)
         display(Markdown(
@@ -1556,10 +1580,20 @@ def run_comparison_report(
     display(Markdown("""
 | Coluna | O que significa |
 |---|---|
-| **total_fk** | Registros filhos com FK não-nula avaliados |
-| **invalidas** | FKs que não encontraram um pai válido (deve ser 0) |
-| **%_validas** | Percentual de FKs com pai existente (deve ser 100%) |
+| **linhas** | Total de registros filhos na tabela |
+| **fk_nula** | Filhos com FK nula = sem pai (órfãos pela política do sintetizador) |
+| **%_nula** | Percentual de filhos sem relacionamento nenhum |
+| **total_fk** | Registros filhos com FK preenchida (avaliados) |
+| **invalidas** | FKs preenchidas que não acharam um pai válido (deve ser 0) |
+| **%_validas** | Percentual de FKs preenchidas com pai existente (deve ser 100%) |
 """))
+    display(Markdown(
+        "> ⚠️ **`%_validas` e `%_nula` contam coisas diferentes.** `%_validas=100%` "
+        "garante que toda FK *preenchida* tem pai — mas se `%_nula` for alto, muitos "
+        "filhos não têm pai algum (órfãos intencionais). Para afirmar que o "
+        "relacionamento está **mantido**, olhe as duas: FKs preenchidas 100% válidas "
+        "**e** `%_nula` na taxa esperada pela sua `orphan_policy`."
+    ))
     if len(fk_report):
         display(_style_df(fk_report, score_col=None, status_col="status"))
     else:

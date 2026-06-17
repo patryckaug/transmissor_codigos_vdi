@@ -1,0 +1,374 @@
+{
+  "ENTIDADE": {
+    "pk_cols": [
+      "NUM_ID_ENTIDADE"
+    ]
+  },
+  "TIPO_DEBITO": {
+    "pk_cols": [
+      "COD_TIPO_DEBITO"
+    ],
+    "static": true
+  },
+  "JUROS_FLUTUANTE": {
+    "pk_cols": [
+      "NUM_CONDICAO_IF"
+    ]
+  },
+  "OPCAO_RECOMPRA": {
+    "pk_cols": [
+      "NUM_ID_OPCAO_RECOMPRA"
+    ],
+    "static": true
+  },
+  "CERTIFICACAO_CETIP": {
+    "pk_cols": [
+      "NUM_ID_CERTIFICACAO_CETIP"
+    ],
+    "static": true
+  },
+  "USUARIO": {
+    "pk_cols": [
+      "NUM_ID_ENTIDADE"
+    ]
+  },
+  "ESPECIFICACAO_COMITENTE": {
+    "pk_cols": [
+      "NUM_ID_ESPECIFICACAO_COMITENTE"
+    ],
+    "foreign_keys": [
+      {
+        "columns": [
+          "COD_TIPO_POSICAO_CARTEIRA"
+        ],
+        "parent_table": "TIPO_POSICAO_CARTEIRA",
+        "parent_columns": [
+          "COD_TIPO_POSICAO_CARTEIRA"
+        ]
+      }
+    ]
+  },
+  "NATUREZA_ECONOMICA": {
+    "pk_cols": [
+      "NUM_ID_NATUREZA_ECONOMICA"
+    ],
+    "static": true
+  },
+  "INSTRUMENTO_FINANCEIRO": {
+    "pk_cols": [
+      "NUM_IF"
+    ],
+    "foreign_keys": [
+      {
+        "columns": [
+          "NUM_ID_MOTIVO_SITUACAO_IF"
+        ],
+        "parent_table": "MOTIVO_SITUACAO_IF",
+        "parent_columns": [
+          "NUM_ID_MOTIVO_SITUACAO_IF"
+        ]
+      }
+    ]
+  },
+  "TITULO": {
+    "pk_cols": [
+      "NUM_IF"
+    ]
+  },
+  "OBJETO_SERVICO": {
+    "pk_cols": [
+      "NUM_ID_OBJETO_SERVICO"
+    ],
+    "static": true
+  },
+  "TIPO_OPER_PTA_CARTEIRA": {
+    "pk_cols": [
+      "NUM_ID_TIPO_OPER_PTA_CARTEIRA"
+    ],
+    "foreign_keys": [
+      {
+        "columns": [
+          "COD_TIPO_DEBITO"
+        ],
+        "parent_table": "TIPO_DEBITO",
+        "parent_columns": [
+          "COD_TIPO_DEBITO"
+        ]
+      },
+      {
+        "columns": [
+          "COD_TIPO_POSICAO_CARTEIRA"
+        ],
+        "parent_table": "TIPO_POSICAO_CARTEIRA",
+        "parent_columns": [
+          "COD_TIPO_POSICAO_CARTEIRA"
+        ]
+      }
+    ],
+    "static": true
+  },
+  "NAT_ECON_TP_OPER_PONTA": {
+    "pk_cols": [
+      "NUM_ID_NAT_ECON_TP_OPER_PONTA"
+    ],
+    "static": true
+  },
+  "PARAMETRIZACAO_TIPO_REGIME": {
+    "pk_cols": [
+      "NUM_ID_PARAM_TIPO_REGIME"
+    ],
+    "static": true
+  },
+  "CARTEIRA_COMITENTE": {
+    "pk_cols": [
+      "NUM_CARTEIRA_COMITENTE"
+    ],
+    "foreign_keys": [
+      {
+        "columns": [
+          "COD_TIPO_POSICAO_CARTEIRA"
+        ],
+        "parent_table": "TIPO_POSICAO_CARTEIRA",
+        "parent_columns": [
+          "COD_TIPO_POSICAO_CARTEIRA"
+        ]
+      }
+    ]
+  },
+  "CONDICAO_IF": {
+    "pk_cols": [
+      "NUM_CONDICAO_IF"
+    ]
+  },
+  "FORMA_PAGAMENTO": {
+    "pk_cols": [
+      "NUM_ID_FORMA_PAGAMENTO"
+    ],
+    "static": true
+  },
+  "NAT_ECO_TIPO_IF": {
+    "pk_cols": [
+      "NUM_ID_NAT_ECO_TIPO_IF"
+    ],
+    "static": true
+  },
+  "TCTPCONTROLE_IF_DEPR": {
+    "pk_cols": [
+      "NUM_CONTROLE_IF_DEPOSITARIA"
+    ]
+  },
+  "RELACAO": {
+    "pk_cols": [
+      "NUM_ID_RELACAO"
+    ]
+  },
+  "PARAMETRO_CONFIG": {
+    "pk_cols": [
+      "NUM_ID_PARAMETRO_CONFIG"
+    ],
+    "static": true
+  },
+  "BLOQUEIO_OPERACAO_IF": {
+    "pk_cols": [
+      "NUM_ID_BLOQUEIO_OPERACAO_IF"
+    ]
+  },
+  "CREDITO": {
+    "pk_cols": [
+      "NUM_IF"
+    ]
+  },
+  "PAPEL_PARTICIPANTE": {
+    "pk_cols": [
+      "COD_PAPEL_PARTICIPANTE"
+    ],
+    "static": true
+  },
+  "DEPOSITO_AUTOMATICO_IF": {
+    "pk_cols": [
+      "NUM_IF"
+    ]
+  },
+  "OPERACAO": {
+    "pk_cols": [
+      "NUM_ID_OPERACAO"
+    ],
+    "foreign_keys": [
+      {
+        "columns": [
+          "COD_TIPO_DEBITO_P1"
+        ],
+        "parent_table": "TIPO_DEBITO",
+        "parent_columns": [
+          "COD_TIPO_DEBITO"
+        ]
+      },
+      {
+        "columns": [
+          "COD_TIPO_DEBITO_P2"
+        ],
+        "parent_table": "TIPO_DEBITO",
+        "parent_columns": [
+          "COD_TIPO_DEBITO"
+        ]
+      },
+      {
+        "columns": [
+          "NUM_ID_MODALIDADE_LIQUIDACAO"
+        ],
+        "parent_table": "MODALIDADE_LIQUIDACAO",
+        "parent_columns": [
+          "NUM_ID_MODALIDADE_LIQUIDACAO"
+        ]
+      }
+    ]
+  },
+  "SITUACAO_CONTA": {
+    "pk_cols": [
+      "NUM_ID_SITUACAO_CONTA"
+    ],
+    "static": true
+  },
+  "TCTPHABILITA_OPERACAO_SERVICO": {
+    "pk_cols": [
+      "NUM_HABILITA_OPERACAO_SERVICO"
+    ],
+    "static": true
+  },
+  "TIPO_OPER_OBJETO_SERV": {
+    "pk_cols": [
+      "NUM_ID_TIPO_OPER_OBJETO_SERV"
+    ],
+    "static": true
+  },
+  "LANCAMENTO": {
+    "pk_cols": [
+      "NUM_ID_LANCAMENTO"
+    ]
+  },
+  "TIPO_POSICAO_CARTEIRA": {
+    "pk_cols": [
+      "COD_TIPO_POSICAO_CARTEIRA"
+    ],
+    "static": true
+  },
+  "MODALIDADE_LIQUIDACAO": {
+    "pk_cols": [
+      "NUM_ID_MODALIDADE_LIQUIDACAO"
+    ],
+    "static": true
+  },
+  "ESPECIFICACAO": {
+    "pk_cols": [
+      "NUM_ID_ESPECIFICACAO"
+    ],
+    "foreign_keys": [
+      {
+        "columns": [
+          "COD_PAPEL_PARTICIPANTE"
+        ],
+        "parent_table": "PAPEL_PARTICIPANTE",
+        "parent_columns": [
+          "COD_PAPEL_PARTICIPANTE"
+        ]
+      }
+    ]
+  },
+  "MALOTE": {
+    "pk_cols": [
+      "NUM_ID_MALOTE"
+    ]
+  },
+  "CONTA_PARTICIPANTE": {
+    "pk_cols": [
+      "NUM_CONTA_PARTICIPANTE"
+    ],
+    "foreign_keys": [
+      {
+        "columns": [
+          "NUM_ID_SITUACAO_CONTA"
+        ],
+        "parent_table": "SITUACAO_CONTA",
+        "parent_columns": [
+          "NUM_ID_SITUACAO_CONTA"
+        ]
+      }
+    ]
+  },
+  "EVENTO": {
+    "pk_cols": [
+      "NUM_EVENTO"
+    ]
+  },
+  "DADO_OPERACAO": {
+    "pk_cols": [
+      "NUM_ID_DADO_OPERACAO"
+    ]
+  },
+  "TIPO_IF": {
+    "pk_cols": [
+      "NUM_TIPO_IF"
+    ],
+    "static": true
+  },
+  "COMITENTE_FATCA": {
+    "pk_cols": [
+      "NUM_ID_ENTIDADE"
+    ]
+  },
+  "CARTEIRA_PARTICIPANTE": {
+    "pk_cols": [
+      "NUM_CARTEIRA_PARTICIPANTE"
+    ],
+    "foreign_keys": [
+      {
+        "columns": [
+          "COD_TIPO_POSICAO_CARTEIRA"
+        ],
+        "parent_table": "TIPO_POSICAO_CARTEIRA",
+        "parent_columns": [
+          "COD_TIPO_POSICAO_CARTEIRA"
+        ]
+      }
+    ]
+  },
+  "PARTICIPANTE": {
+    "pk_cols": [
+      "NUM_ID_ENTIDADE"
+    ]
+  },
+  "PARAMETRIZACAO_REGIME_MERCADO": {
+    "pk_cols": [
+      "NUM_ID_PARAM_REGIME_MERCADO"
+    ],
+    "static": true
+  },
+  "TIPO_DADO_OPERACAO": {
+    "pk_cols": [
+      "NUM_ID_TIPO_DADO_OPERACAO"
+    ],
+    "static": true
+  },
+  "TCTPFEATURE_TOGGLE": {
+    "pk_cols": [
+      "NUM_IDT_FTRE_TOG"
+    ],
+    "static": true
+  },
+  "COMITENTE_INR": {
+    "pk_cols": [
+      "NUM_ID_ENTIDADE"
+    ]
+  },
+  "MOTIVO_SITUACAO_IF": {
+    "pk_cols": [
+      "NUM_ID_MOTIVO_SITUACAO_IF"
+    ],
+    "static": true
+  },
+  "RESGATE": {
+    "pk_cols": [
+      "NUM_CONDICAO_IF"
+    ]
+  }
+}

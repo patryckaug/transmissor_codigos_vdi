@@ -71,6 +71,7 @@ from __future__ import annotations
 import glob
 import io
 import os
+import time
 import traceback
 import warnings as _warnings
 _warnings.filterwarnings("ignore", category=FutureWarning, module=r"pandas.*")
@@ -699,6 +700,77 @@ def _fence(text: Optional[str]) -> str:
     return "```\n" + (text or "").strip() + "\n```"
 
 
+def _fast_column_shapes(
+    real:  Dict[str, pd.DataFrame],
+    synth: Dict[str, pd.DataFrame],
+    metadata: Mapping[str, Any],
+) -> Tuple[Optional[float], pd.DataFrame]:
+    """
+    Column Shapes SEM o Column Pair Trends — evita o custo O(colunas²) que é
+    o gargalo do QualityReport em tabelas largas.
+
+    Para cada coluna não-chave:
+      • numérica            → KSComplement = 1 - estatística KS (scipy.ks_2samp)
+      • categórica/booleana → TVComplement = 1 - TVD
+        (TVD = 0.5 · Σ |p_real(cat) - p_synth(cat)| sobre a união de categorias)
+
+    Custo por coluna: O(n log n) (numérica) ou O(n) (categórica). Sem pares.
+    Retorna (score_médio, detalhe_por_coluna).
+    """
+    try:
+        from scipy.stats import ks_2samp
+    except Exception:
+        ks_2samp = None
+
+    linhas: List[dict] = []
+    tabs = metadata.get("tables", {})
+
+    for t in sorted(set(real) & set(synth)):
+        cols_meta = tabs.get(t, {}).get("columns", {})
+        r_df, s_df = real[t], synth[t]
+        for col in r_df.columns:
+            if col not in s_df.columns:
+                continue
+            if cols_meta.get(col, {}).get("sdtype", "") == "id":
+                continue  # chaves não entram em Column Shapes
+            r = r_df[col].dropna()
+            s = s_df[col].dropna()
+            if len(r) == 0 or len(s) == 0:
+                continue
+
+            if pd.api.types.is_numeric_dtype(r) and pd.api.types.is_numeric_dtype(s):
+                metric = "KSComplement"
+                if ks_2samp is not None:
+                    try:
+                        stat  = ks_2samp(r.values, s.values).statistic
+                        score = 1.0 - float(stat)
+                    except Exception:
+                        score = np.nan
+                else:
+                    score = np.nan
+            else:
+                metric = "TVComplement"
+                r_p  = r.astype(str).value_counts(normalize=True)
+                s_p  = s.astype(str).value_counts(normalize=True)
+                cats = r_p.index.union(s_p.index)
+                tvd  = 0.5 * float(
+                    (r_p.reindex(cats, fill_value=0.0)
+                     - s_p.reindex(cats, fill_value=0.0)).abs().sum()
+                )
+                score = 1.0 - tvd
+
+            linhas.append({
+                "Table":  t,
+                "Column": col,
+                "Metric": metric,
+                "Score":  score,
+            })
+
+    detail = pd.DataFrame(linhas)
+    media  = float(detail["Score"].mean()) if len(detail) else None
+    return media, detail
+
+
 # ============================================================
 # 4. Integridade direta (PK + FK em pandas)
 # ============================================================
@@ -1049,6 +1121,10 @@ def run_comparison_report(
     synthetic_prefix: Optional[str] = None,
     max_rows: Optional[int] = 50_000,
     show_distribution_plots: bool = True,
+    compute_diagnostic: bool = True,
+    compute_quality: bool = True,
+    skip_pair_trends: bool = False,
+    show_timing: bool = False,
     verbose: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -1079,6 +1155,13 @@ def run_comparison_report(
                               materializar 100k+ linhas de várias tabelas.
                               Use None para carregar tudo (cuidado com RAM).
     show_distribution_plots : exibe gráficos original vs sintético por coluna
+    compute_diagnostic      : se False, pula o DiagnosticReport do SDMetrics
+    compute_quality         : se False, pula o QualityReport (a parte cara)
+    skip_pair_trends        : se True, calcula a qualidade só com Column Shapes
+                              (KS/TV por coluna), pulando o Column Pair Trends —
+                              que é O(colunas²) e costuma ser o gargalo. A
+                              integridade de FK continua na checagem direta.
+    show_timing             : imprime o tempo gasto em cada fase ao final
     verbose                 : passa verbose para o SDMetrics
 
     Resolução do caminho sintético
@@ -1134,6 +1217,9 @@ def run_comparison_report(
         display(Markdown(f"---\n### {emoji} {titulo}"))
 
     # ── 1. leitura ───────────────────────────────────────────
+    timings: Dict[str, float] = {}
+    _t0 = time.perf_counter()
+
     display(Markdown("# 📊 EngordAI — Avaliação Sintético vs Original"))
     print("Lendo dados originais...")
     real = _load_all(
@@ -1150,10 +1236,13 @@ def run_comparison_report(
         synth_paths, synthetic_format,
         label="sintético", max_rows=max_rows,
     )
+    timings["leitura"] = time.perf_counter() - _t0
 
+    _t0 = time.perf_counter()
     with _silence():
         real, synth = _align_tables(real, synth)
         metadata    = build_sdmetrics_metadata(real, specs_config)
+    timings["alinhar+metadata"] = time.perf_counter() - _t0
 
     # ── 1b. pré-voo: detecta causas comuns de falha ANTES do cálculo ──
     preflight_problems = _preflight_metadata(real, synth, specs_config, metadata)
@@ -1200,8 +1289,7 @@ def run_comparison_report(
             "diagnóstico de erros mais abaixo."
         ))
 
-    # ── 3. métricas SDMetrics (com fallback e erro visível) ──
-    print("Calculando métricas SDMetrics (warnings internos suprimidos)...")
+    # ── 3. métricas SDMetrics (gating + timing + fallback) ──
     diag_score = qual_score = None
     diag_props = qual_props = shapes_detail = None
     rel_detail = card_detail = None
@@ -1209,38 +1297,70 @@ def run_comparison_report(
     diag_error = qual_error = None
     diag_fallback = qual_fallback = False
 
-    if metadata.get("tables"):
-        with _silence():
-            (diag, diag_score, diag_props,
-             diag_error, diag_fallback) = _try_report(
-                DiagnosticReport, real, synth, metadata, verbose
-            )
-            if diag is not None:
-                try:
-                    rel_detail = diag.get_details("Relationship Validity")
-                except Exception:
-                    pass
-
-            (qual, qual_score, qual_props,
-             qual_error, qual_fallback) = _try_report(
-                QualityReport, real, synth, metadata, verbose
-            )
-            if qual is not None:
-                try:
-                    shapes_detail = qual.get_details("Column Shapes")
-                except Exception:
-                    pass
-                try:
-                    card_detail = qual.get_details("Cardinality")
-                except Exception:
-                    pass
-    else:
+    if not metadata.get("tables"):
         diag_error = qual_error = (
             "Metadata sem tabelas — o cálculo do SDMetrics não foi nem tentado."
         )
+    else:
+        # ---- Diagnóstico (barato: validade + estrutura + relacionamento) ----
+        if compute_diagnostic:
+            print("Calculando diagnóstico SDMetrics...")
+            _t0 = time.perf_counter()
+            with _silence():
+                (diag, diag_score, diag_props,
+                 diag_error, diag_fallback) = _try_report(
+                    DiagnosticReport, real, synth, metadata, verbose
+                )
+                if diag is not None:
+                    try:
+                        rel_detail = diag.get_details("Relationship Validity")
+                    except Exception:
+                        pass
+            timings["diagnostic"] = time.perf_counter() - _t0
+        else:
+            print("Diagnóstico SDMetrics PULADO (compute_diagnostic=False).")
+
+        # ---- Qualidade (CARA: Column Pair Trends é O(colunas²) — o gargalo) ----
+        if compute_quality:
+            _t0 = time.perf_counter()
+            if skip_pair_trends:
+                print("Calculando qualidade — só Column Shapes (Pair Trends pulado)...")
+                with _silence():
+                    qual_score, shapes_detail = _fast_column_shapes(
+                        real, synth, metadata
+                    )
+                if qual_score is not None:
+                    qual_props = pd.DataFrame(
+                        [{"Property": "Column Shapes", "Score": qual_score}]
+                    )
+                else:
+                    qual_error = (
+                        "Column Shapes rápido não retornou nenhuma coluna elegível."
+                    )
+            else:
+                print("Calculando qualidade SDMetrics — Column Pair Trends é o passo lento...")
+                with _silence():
+                    (qual, qual_score, qual_props,
+                     qual_error, qual_fallback) = _try_report(
+                        QualityReport, real, synth, metadata, verbose
+                    )
+                    if qual is not None:
+                        try:
+                            shapes_detail = qual.get_details("Column Shapes")
+                        except Exception:
+                            pass
+                        try:
+                            card_detail = qual.get_details("Cardinality")
+                        except Exception:
+                            pass
+            timings["quality"] = time.perf_counter() - _t0
+        else:
+            print("Qualidade SDMetrics PULADA (compute_quality=False).")
 
     # ── 4. integridade direta ────────────────────────────────
+    _t0 = time.perf_counter()
     pk_report, fk_report = direct_integrity_checks(synth, specs_config)
+    timings["integridade_direta"] = time.perf_counter() - _t0
 
     # corrige bug ReferentialIntegrity
     rel_detail, diag_props_fix, diag_score_fix, rel_ajustado = (
@@ -1374,6 +1494,16 @@ def run_comparison_report(
     else:
         display(Markdown("_Qualidade SDMetrics indisponível (ver bloco de erros acima)._"))
 
+    if skip_pair_trends and qual_score is not None:
+        display(Markdown(
+            "> ⚡ **Modo rápido ligado:** o score de qualidade acima reflete "
+            "**apenas Column Shapes** (a distribuição de cada coluna, via KS/TV). "
+            "O **Column Pair Trends** (correlações entre pares de colunas) e a "
+            "**Cardinality** foram pulados — é justamente o passo O(colunas²) que "
+            "torna o relatório lento em tabelas largas. Rode com "
+            "`skip_pair_trends=False` para o score estatístico completo."
+        ))
+
     if card_detail is not None and len(card_detail) > 0:
         display(Markdown(
             "**Fan-out por relacionamento** — compara a curva de quantos filhos "
@@ -1449,7 +1579,9 @@ def run_comparison_report(
             "🔵 **Azul escuro** = original &nbsp;·&nbsp; "
             "🩵 **Verde azulado** = sintético"
         ))
+        _t0 = time.perf_counter()
         _dist_plots(real, synth)
+        timings["graficos"] = time.perf_counter() - _t0
 
     # ── 11. resumo final ─────────────────────────────────────
     display(Markdown("---"))
@@ -1468,6 +1600,22 @@ def run_comparison_report(
         f"FKs com órfãos: **{falhas_fk}**"
     ))
 
+    # ── 12. tempo por fase (opcional) ────────────────────────
+    if show_timing and timings:
+        _sec("Tempo por fase", "⏱️")
+        _tt = pd.DataFrame(
+            [{"fase": k, "segundos": round(v, 2)} for k, v in timings.items()]
+        ).sort_values("segundos", ascending=False).reset_index(drop=True)
+        total = sum(timings.values())
+        display(
+            _tt.style.format({"segundos": "{:.2f}s"}).set_table_styles([
+                {"selector": "th",
+                 "props": f"background:{_NAVY};color:white;padding:6px 8px"},
+                {"selector": "td", "props": "padding:5px 8px"},
+            ])
+        )
+        display(Markdown(f"**Total: {total:.2f}s**"))
+
     return {
         "diagnostic_score":   diag_score,
         "quality_score":      qual_score,
@@ -1479,4 +1627,5 @@ def run_comparison_report(
         "diagnostic_error":   diag_error,
         "quality_error":      qual_error,
         "preflight_problems": preflight_problems,
+        "timings":            timings,
     }

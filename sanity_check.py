@@ -283,3 +283,15 @@ def display_preappend_report(rel: Mapping[str, Any]) -> None:
         "6. Se produção recebe escrita concorrente, garantir lock ou offset de "
         "PK reservado, senão o max(PK) pode mudar entre o SELECT e o INSERT."
     ))
+
+
+
+# from preappend_check import run_preappend_check, display_preappend_report
+
+# rel = run_preappend_check(
+#     synthetic_path = "oci://oci-st-blc-engordai-qab-n@gr97zovfhcmu/synthetic",
+#     original_path  = "oci://oci-st-blc-engordai-qab-n@gr97zovfhcmu/onprem-export",
+#     fmt            = "parquet",
+#     max_rows       = None,    # obrigatório None; ele recusa amostra
+# )
+# display_preappend_report(rel)

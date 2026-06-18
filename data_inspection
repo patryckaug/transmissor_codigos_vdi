@@ -95,7 +95,7 @@ def display_head_comparison(
     n_rows: int = 8,
     random_sample: bool = False,
     max_cols: Optional[int] = None,
-    max_rows_read: Optional[int] = 10_000,
+    max_rows_read: Optional[int] = 2_000,
     seed: int = 42,
     verbose: bool = True,
 ) -> None:
@@ -150,18 +150,40 @@ def display_head_comparison(
         display(Markdown("> ❌ Nenhuma tabela em comum para inspecionar."))
         return
 
-    for t in comuns:
+    import sys, time
+    total = len(comuns)
+    if verbose:
+        print(f"Inspecionando {total} tabela(s) em comum. "
+              f"Lendo até {max_rows_read if max_rows_read else 'todas as'} "
+              f"linhas por tabela (só para o head).", flush=True)
+    t_inicio = time.perf_counter()
+
+    for i, t in enumerate(comuns, start=1):
         if verbose:
-            print(f"Lendo {t}...")
+            decorrido = time.perf_counter() - t_inicio
+            print(f"[{i}/{total}] {t}: lendo original... "
+                  f"(decorrido {decorrido:.0f}s)", flush=True)
         try:
+            _t0 = time.perf_counter()
             r = _read_table(orig_paths[t], fmt, max_rows_read, seed)
+            t_orig = time.perf_counter() - _t0
+            if verbose:
+                print(f"[{i}/{total}] {t}: original ok ({len(r):,} linhas, "
+                      f"{t_orig:.1f}s) · lendo sintético...", flush=True)
+            _t0 = time.perf_counter()
             s = _read_table(synth_paths[t], fmt, max_rows_read, seed)
+            t_synth = time.perf_counter() - _t0
+            if verbose:
+                print(f"[{i}/{total}] {t}: sintético ok ({len(s):,} linhas, "
+                      f"{t_synth:.1f}s) · renderizando.", flush=True)
         except Exception as exc:
             display(Markdown(f"---\n### 📑 `{t}`"))
             display(Markdown(f"> ❌ Falha ao ler: `{exc}`"))
+            if verbose:
+                print(f"[{i}/{total}] {t}: FALHA — {exc}", flush=True)
             continue
 
-        display(Markdown(f"---\n### 📑 `{t}`"))
+        display(Markdown(f"---\n### 📑 `{t}`  <small>({i}/{total})</small>"))
 
         # bandeira de colunas divergentes (nome ou tipo) — guia o olho
         rcols, scols = list(r.columns), list(s.columns)
@@ -213,12 +235,7 @@ def display_head_comparison(
         display(HTML(meta_s))
         display(_style_head(s_view, _TEAL))
 
-
-from sdv_inspect import display_head_comparison
-
-display_head_comparison(
-    original_path  = "oci://oci-st-blc-engordai-qab-n@gr97zovfhcmu/onprem-export",
-    synthetic_path = "oci://oci-st-blc-engordai-qab-n@gr97zovfhcmu/synthetic",
-    fmt            = "parquet",
-    n_rows         = 8,
-)
+    if verbose:
+        total_s = time.perf_counter() - t_inicio
+        print(f"Concluído: {total} tabela(s) inspecionada(s) em {total_s:.0f}s.",
+              flush=True)

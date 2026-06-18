@@ -1,0 +1,105 @@
+-- ============================================================
+-- verificacao_preappend_producao.sql
+-- ============================================================
+-- Verificação de COLISÃO DE PK contra o banco de PRODUÇÃO (Oracle),
+-- a ser rodada no DBeaver ANTES do append do conjunto sintético.
+--
+-- REGRA DE OURO: contra produção, SOMENTE SELECT. Este arquivo não contém
+-- (e não deve conter) INSERT/UPDATE/DELETE/DDL. O append em si é feito pelo
+-- processo controlado do engenheiro, em transação — NUNCA por query manual
+-- no DBeaver.
+--
+-- COMO USAR
+-- ---------
+-- 1. Rode o preappend_check.py (Python) e anote, por tabela, o min_synth de
+--    cada PK numérica (coluna "min_synth" do pk_ranges).
+-- 2. Rode os SELECTs abaixo no DBeaver conectado à PRODUÇÃO.
+-- 3. Compare: o append só é SEGURO para a tabela se
+--        min_synth (do sintético)  >  max_pk_producao (deste SELECT)
+--    Ou seja, todo o range sintético fica ACIMA do que já existe.
+-- 4. Se min_synth <= max_pk_producao para QUALQUER tabela:
+--        -> NÃO appendar. Re-gerar as PKs sintéticas com offset acima do
+--           max de produção (append_after_max_pk a partir do estado REAL).
+--
+-- ATENÇÃO À CONCORRÊNCIA: se produção recebe inserções enquanto você verifica,
+-- o max(PK) pode subir entre este SELECT e o append. Rode esta verificação o
+-- mais próximo possível do append, e o ideal é o engenheiro repetir o
+-- SELECT max(PK) DENTRO da mesma transação do INSERT (com lock/serialização),
+-- não confiar só nesta leitura adiantada.
+--
+-- SUBSTITUA os nomes de TABELA e de COLUNA_PK pelos reais do seu schema.
+-- (No Oracle, identificadores não-citados são tratados em MAIÚSCULAS.)
+-- ============================================================
+
+
+-- ------------------------------------------------------------
+-- A) MAX de PK por tabela — o número a comparar com min_synth
+-- ------------------------------------------------------------
+-- Repita o bloco para cada tabela do append. Troque TABELA / COLUNA_PK.
+
+SELECT 'TABELA'              AS tabela,
+       'COLUNA_PK'           AS pk,
+       COUNT(*)              AS linhas_producao,
+       MIN(COLUNA_PK)        AS min_pk_producao,
+       MAX(COLUNA_PK)        AS max_pk_producao
+FROM   TABELA;
+
+-- Exemplo concreto (ajuste aos seus nomes):
+-- SELECT 'INSTRUMENTO' AS tabela, 'COD_INSTRUMENTO' AS pk,
+--        COUNT(*) AS linhas_producao,
+--        MIN(COD_INSTRUMENTO) AS min_pk_producao,
+--        MAX(COD_INSTRUMENTO) AS max_pk_producao
+-- FROM   INSTRUMENTO;
+
+
+-- ------------------------------------------------------------
+-- B) Versão consolidada — vários MAX numa tira só (UNION ALL)
+-- ------------------------------------------------------------
+-- Cole uma linha por tabela. Resultado: uma coluna max_pk_producao por tabela,
+-- fácil de comparar lado a lado com os min_synth do preappend_check.
+
+SELECT 'INSTRUMENTO' AS tabela, MAX(COD_INSTRUMENTO) AS max_pk_producao FROM INSTRUMENTO
+UNION ALL
+SELECT 'OPERACAO'    AS tabela, MAX(COD_OPERACAO)    AS max_pk_producao FROM OPERACAO
+UNION ALL
+SELECT 'ENTIDADE'    AS tabela, MAX(COD_ENT)         AS max_pk_producao FROM ENTIDADE
+-- ... adicione UNION ALL para cada tabela do append ...
+;
+
+
+-- ------------------------------------------------------------
+-- C) Checagem direta de COLISÃO (PK não-numérica ou para confirmar)
+-- ------------------------------------------------------------
+-- Se a PK não é numérica (ranges não bastam), ou para confirmação final,
+-- conte quantas PKs sintéticas JÁ EXISTEM em produção. Tem que dar 0.
+--
+-- Pré-requisito: ter as PKs sintéticas acessíveis em produção como uma tabela
+-- temporária / staging de SOMENTE LEITURA (NÃO as tabelas-alvo). Se você não
+-- tem staging, pule este bloco e use os ranges (A/B) — ou peça ao engenheiro
+-- para carregar o sintético numa STAGING separada antes de verificar.
+--
+-- Troque TABELA_ALVO / STAGING_SINTETICO / COLUNA_PK pelos reais.
+
+-- SELECT COUNT(*) AS pks_em_colisao
+-- FROM   STAGING_SINTETICO s
+-- WHERE  EXISTS (
+--          SELECT 1 FROM TABELA_ALVO p
+--          WHERE p.COLUNA_PK = s.COLUNA_PK
+--        );
+-- -- Resultado esperado: 0. Qualquer valor > 0 = COLISÃO = NÃO appendar.
+
+
+-- ------------------------------------------------------------
+-- D) Sanidade pós-append (rodar DEPOIS, ainda em transação, antes do COMMIT)
+-- ------------------------------------------------------------
+-- O engenheiro pode rodar, dentro da transação do append e ANTES do COMMIT:
+--   • contagem esperada de linhas inseridas por tabela;
+--   • zero duplicata de PK;
+--   • zero FK órfã.
+-- Se qualquer um falhar -> ROLLBACK. Exemplo de duplicata de PK:
+
+-- SELECT COLUNA_PK, COUNT(*) AS qtd
+-- FROM   TABELA_ALVO
+-- GROUP  BY COLUNA_PK
+-- HAVING COUNT(*) > 1;
+-- -- Esperado: nenhuma linha. Qualquer linha = PK duplicada = ROLLBACK.

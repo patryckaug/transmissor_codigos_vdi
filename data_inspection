@@ -214,11 +214,11 @@ def display_head_comparison(
         display(_style_head(s_view, _TEAL))
 
 
-# from sdv_inspect import display_head_comparison
+from sdv_inspect import display_head_comparison
 
-# display_head_comparison(
-#     original_path  = "oci://oci-st-blc-engordai-qab-n@gr97zovfhcmu/onprem-export",
-#     synthetic_path = "oci://oci-st-blc-engordai-qab-n@gr97zovfhcmu/synthetic",
-#     fmt            = "parquet",
-#     n_rows         = 8,
-# )
+display_head_comparison(
+    original_path  = "oci://oci-st-blc-engordai-qab-n@gr97zovfhcmu/onprem-export",
+    synthetic_path = "oci://oci-st-blc-engordai-qab-n@gr97zovfhcmu/synthetic",
+    fmt            = "parquet",
+    n_rows         = 8,
+)

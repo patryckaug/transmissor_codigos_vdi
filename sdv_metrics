@@ -700,202 +700,75 @@ def _fence(text: Optional[str]) -> str:
     return "```\n" + (text or "").strip() + "\n```"
 
 
-def _classify_columns_for_shapes(
-    real:  Dict[str, pd.DataFrame],
-    synth: Dict[str, pd.DataFrame],
-    metadata: Mapping[str, Any],
-    *,
-    max_cat_card_ratio: float = 0.5,
-    exclude_idlike_numeric: bool = True,
-    idlike_numeric_ratio: float = 0.95,
-    exclude_cols: Optional[List[str]] = None,
-) -> pd.DataFrame:
-    """
-    Decide, de forma TRANSPARENTE, quais colunas entram no Column Shapes.
-
-    Devolve um DataFrame de auditoria com uma linha por coluna:
-    Table, Column, sdtype, n_unique, ratio_unique, null_%, elegivel, motivo.
-
-    Regras de exclusão (uma coluna fora do cálculo de fidelidade quando):
-      • é chave PK/FK declarada (sdtype 'id') — identificador, não tem
-        "distribuição" para comparar;
-      • está em `exclude_cols` — você marcou manualmente;
-      • não existe na tabela sintética;
-      • é quase toda nula (≥ 99% no original OU no sintético);
-      • é CATEGÓRICA/texto de alta cardinalidade (mais de `max_cat_card_ratio`
-        dos valores são únicos E > 50 distintos) — cara de nome/descrição/ID
-        textual; o TVComplement não mede isso de forma útil;
-      • é um INTEIRO quase único (ratio ≥ `idlike_numeric_ratio`) e
-        `exclude_idlike_numeric=True` — quase certamente um ID não declarado.
-
-    O que NUNCA é excluído por cardinalidade: coluna NUMÉRICA contínua
-    (float). O KS lida com qualquer cardinalidade, então saldo/valor/contínuas
-    permanecem no cálculo mesmo sendo quase únicas.
-    """
-    exclude_set = set(exclude_cols or [])
-    tabs = metadata.get("tables", {})
-    linhas: List[dict] = []
-
-    for t in sorted(set(real) & set(synth)):
-        cols_meta = tabs.get(t, {}).get("columns", {})
-        r_df, s_df = real[t], synth[t]
-        n = len(r_df)
-        for col in r_df.columns:
-            sdtype   = cols_meta.get(col, {}).get("sdtype", "")
-            r        = r_df[col]
-            in_synth = col in s_df.columns
-            nun      = int(r.nunique(dropna=True))
-            ratio    = (nun / n) if n else 0.0
-            null_r   = float(r.isna().mean() * 100.0)
-            null_s   = float(s_df[col].isna().mean() * 100.0) if in_synth else 100.0
-            is_num   = (
-                pd.api.types.is_numeric_dtype(r)
-                and in_synth and pd.api.types.is_numeric_dtype(s_df[col])
-            )
-            is_int   = is_num and pd.api.types.is_integer_dtype(r)
-
-            elegivel, motivo = True, "ok"
-            if sdtype == "id":
-                elegivel, motivo = False, "chave PK/FK (identificador)"
-            elif col in exclude_set:
-                elegivel, motivo = False, "excluída manualmente"
-            elif not in_synth:
-                elegivel, motivo = False, "ausente no sintético"
-            elif null_r >= 99.0 or null_s >= 99.0:
-                elegivel, motivo = False, "quase toda nula (≥99%)"
-            elif (not is_num) and ratio > max_cat_card_ratio and nun > 50:
-                elegivel, motivo = (
-                    False,
-                    f"categórica de alta cardinalidade ({nun} únicos, {ratio:.0%}) — texto/ID provável",
-                )
-            elif exclude_idlike_numeric and is_int and ratio >= idlike_numeric_ratio:
-                elegivel, motivo = (
-                    False,
-                    f"inteiro quase único ({ratio:.0%} distintos) — ID provável",
-                )
-
-            linhas.append({
-                "Table":        t,
-                "Column":       col,
-                "sdtype":       sdtype or ("numerical" if is_num else "categorical"),
-                "n_unique":     nun,
-                "ratio_unique": round(ratio, 3),
-                "null_%":       round(null_r, 1),
-                "elegivel":     elegivel,
-                "motivo":       motivo,
-            })
-
-    return pd.DataFrame(linhas)
-
-
 def _fast_column_shapes(
     real:  Dict[str, pd.DataFrame],
     synth: Dict[str, pd.DataFrame],
     metadata: Mapping[str, Any],
-    *,
-    classification: Optional[pd.DataFrame] = None,
-    **classify_kwargs,
-) -> Tuple[Optional[float], pd.DataFrame, pd.DataFrame]:
+) -> Tuple[Optional[float], pd.DataFrame]:
     """
-    Column Shapes SEM o Column Pair Trends — evita o custo O(colunas²) e, mais
-    importante, calcula o score SÓ sobre as colunas comparáveis por
-    distribuição (ver _classify_columns_for_shapes).
+    Column Shapes SEM o Column Pair Trends — evita o custo O(colunas²) que é
+    o gargalo do QualityReport em tabelas largas.
 
-    Para cada coluna ELEGÍVEL:
+    Para cada coluna não-chave:
       • numérica            → KSComplement = 1 - estatística KS (scipy.ks_2samp)
       • categórica/booleana → TVComplement = 1 - TVD
+        (TVD = 0.5 · Σ |p_real(cat) - p_synth(cat)| sobre a união de categorias)
 
-    Retorna (score_médio_elegíveis, detalhe_das_pontuadas, classificacao_completa).
-    O score é a média APENAS das colunas elegíveis — IDs, texto de alta
-    cardinalidade e colunas vazias não poluem mais o número.
+    Custo por coluna: O(n log n) (numérica) ou O(n) (categórica). Sem pares.
+    Retorna (score_médio, detalhe_por_coluna).
     """
     try:
         from scipy.stats import ks_2samp
     except Exception:
         ks_2samp = None
 
-    if classification is None:
-        classification = _classify_columns_for_shapes(
-            real, synth, metadata, **classify_kwargs
-        )
-
     linhas: List[dict] = []
-    for _, c in classification.iterrows():
-        if not c["elegivel"]:
-            continue
-        t, col = c["Table"], c["Column"]
-        if t not in real or t not in synth or col not in synth[t].columns:
-            continue
-        r = real[t][col].dropna()
-        s = synth[t][col].dropna()
-        if len(r) == 0 or len(s) == 0:
-            continue
+    tabs = metadata.get("tables", {})
 
-        if pd.api.types.is_numeric_dtype(r) and pd.api.types.is_numeric_dtype(s):
-            metric = "KSComplement"
-            if ks_2samp is not None:
-                try:
-                    stat  = ks_2samp(r.values, s.values).statistic
-                    score = 1.0 - float(stat)
-                except Exception:
+    for t in sorted(set(real) & set(synth)):
+        cols_meta = tabs.get(t, {}).get("columns", {})
+        r_df, s_df = real[t], synth[t]
+        for col in r_df.columns:
+            if col not in s_df.columns:
+                continue
+            if cols_meta.get(col, {}).get("sdtype", "") == "id":
+                continue  # chaves não entram em Column Shapes
+            r = r_df[col].dropna()
+            s = s_df[col].dropna()
+            if len(r) == 0 or len(s) == 0:
+                continue
+
+            if pd.api.types.is_numeric_dtype(r) and pd.api.types.is_numeric_dtype(s):
+                metric = "KSComplement"
+                if ks_2samp is not None:
+                    try:
+                        stat  = ks_2samp(r.values, s.values).statistic
+                        score = 1.0 - float(stat)
+                    except Exception:
+                        score = np.nan
+                else:
                     score = np.nan
             else:
-                score = np.nan
-        else:
-            metric = "TVComplement"
-            r_p  = r.astype(str).value_counts(normalize=True)
-            s_p  = s.astype(str).value_counts(normalize=True)
-            cats = r_p.index.union(s_p.index)
-            tvd  = 0.5 * float(
-                (r_p.reindex(cats, fill_value=0.0)
-                 - s_p.reindex(cats, fill_value=0.0)).abs().sum()
-            )
-            score = 1.0 - tvd
+                metric = "TVComplement"
+                r_p  = r.astype(str).value_counts(normalize=True)
+                s_p  = s.astype(str).value_counts(normalize=True)
+                cats = r_p.index.union(s_p.index)
+                tvd  = 0.5 * float(
+                    (r_p.reindex(cats, fill_value=0.0)
+                     - s_p.reindex(cats, fill_value=0.0)).abs().sum()
+                )
+                score = 1.0 - tvd
 
-        linhas.append({
-            "Table":    t,
-            "Column":   col,
-            "Metric":   metric,
-            "n_unique": int(c["n_unique"]),
-            "Score":    score,
-        })
+            linhas.append({
+                "Table":  t,
+                "Column": col,
+                "Metric": metric,
+                "Score":  score,
+            })
 
     detail = pd.DataFrame(linhas)
-    scores = pd.to_numeric(detail["Score"], errors="coerce") if len(detail) else pd.Series(dtype=float)
-    media  = float(scores.mean()) if scores.notna().any() else None
-    return media, detail, classification
-
-
-def _metadata_quality_filtered(
-    metadata: Mapping[str, Any],
-    classification: pd.DataFrame,
-) -> Dict[str, Any]:
-    """
-    Metadata SÓ para o QualityReport: marca como 'id' as colunas que a
-    classificação reprovou (alta cardinalidade, ID não declarado, etc.), para
-    o SDMetrics PULÁ-LAS no Column Shapes E no Column Pair Trends — exatamente
-    o mesmo critério da checagem rápida. Não altera chaves nem
-    relacionamentos, então a metadata do DIAGNÓSTICO (integridade) fica intacta
-    (esta cópia é usada só na qualidade).
-    """
-    mq: Dict[str, Any] = {
-        "tables": {},
-        "relationships": list(metadata.get("relationships", [])),
-    }
-    for t, d in metadata.get("tables", {}).items():
-        tcols = {c: dict(v) for c, v in d.get("columns", {}).items()}
-        novo: Dict[str, Any] = {"columns": tcols}
-        if "primary_key" in d:
-            novo["primary_key"] = d["primary_key"]
-        mq["tables"][t] = novo
-
-    reprovadas = classification[~classification["elegivel"]]
-    for _, r in reprovadas.iterrows():
-        t, c = r["Table"], r["Column"]
-        cols = mq["tables"].get(t, {}).get("columns", {})
-        if c in cols and cols[c].get("sdtype") != "id":
-            cols[c] = {"sdtype": "id"}
-    return mq
+    media  = float(detail["Score"].mean()) if len(detail) else None
+    return media, detail
 
 
 # ============================================================

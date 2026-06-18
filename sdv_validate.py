@@ -3,62 +3,53 @@
 sdv_validate.py
 ===============
 
-Validação ESTRUTURAL e RELACIONAL, 100% data-driven, de dados sintéticos
-contra os originais — para decidir, com alta confiança, se a sintetização
-preservou TIPO DE DADO, CHAVES PRIMÁRIAS e CHAVES ESTRANGEIRAS.
+Validação ESTRUTURAL e RELACIONAL de dados sintéticos contra os originais —
+para decidir, com alta confiança, se a sintetização preservou TIPO DE DADO,
+CHAVES PRIMÁRIAS e CHAVES ESTRANGEIRAS.
 
-Princípio central (sem leakage)
--------------------------------
-Este validador NÃO recebe specs_config nem metadado. Ele não confia em
-nenhuma declaração de PK/FK. A "verdade" é inferida dos PRÓPRIOS DADOS, dos
-DOIS lados, e a comparação é feita assim:
+Dois modos (combináveis)
+------------------------
+1. DATA-DRIVEN (padrão, specs_config=None): não confia em nenhuma declaração.
+   A "verdade" é inferida dos PRÓPRIOS DADOS, dos dois lados:
+       Toda propriedade estrutural verdadeira no ORIGINAL tem que continuar
+       verdadeira no SINTÉTICO. Qualquer divergência é uma INCONSISTÊNCIA.
 
-    Toda propriedade estrutural verdadeira no ORIGINAL tem que continuar
-    verdadeira no SINTÉTICO. Qualquer divergência é uma INCONSISTÊNCIA.
+2. DECLARADO (specs_config fornecido): valida diretamente as PK/FK que você
+   declarou (inclusive COMPOSTAS), marcadas como fonte="declarado". Mesmo aqui
+   a declaração é checada contra os dados — uma PK declarada que não é única no
+   próprio original, ou uma FK declarada com órfãos no original, vira ALERTA.
+   A descoberta de relacionamentos NÃO declarados continua ativa por padrão
+   (discover_undeclared=True) — é o ponto cego que a validação por specs_config
+   sozinha não cobre.
 
 Concretamente:
   • TIPO   — o dtype real (lido do schema Parquet) de cada coluna do original
-             tem que bater com o do sintético. Coluna a mais/a menos, ou tipo
-             trocado (int viva como string, etc.) → inconsistência.
-  • PK     — toda coluna (ou par de colunas) que é ÚNICA E NÃO-NULA no original
-             é uma PK candidata. Se ela não for única/não-nula no sintético →
-             inconsistência (o sintetizador quebrou uma chave).
-  • FK     — toda relação de INCLUSÃO observada no original (os valores de uma
-             coluna do filho estão 100% contidos numa coluna-chave de outra
-             tabela) é uma FK candidata. Se essa mesma inclusão quebra no
-             sintético (surgem valores órfãos) → inconsistência.
+             tem que bater com o do sintético.
+  • PK     — coluna(s) ÚNICA(S) E NÃO-NULA(S) no original. Declarada (do
+             specs_config) ou descoberta. Se quebra no sintético → inconsistência.
+  • FK     — relação de INCLUSÃO (valores do filho ⊆ chave do pai). Declarada
+             (do specs_config) ou descoberta. Se a inclusão cai do original para
+             o sintético (surgem órfãos) → inconsistência.
 
-Por que comparativo, e não absoluto
-------------------------------------
-"Existe FK?" é indecidível só pelos dados (coincidência de domínio gera falso
-positivo). Mas "uma inclusão que valia no original parou de valer no sintético"
-é um SINAL DETERMINÍSTICO de que a sintetização degradou um relacionamento —
-mesmo um relacionamento que ninguém declarou no specs_config. É exatamente o
-ponto cego que a validação baseada em specs_config não cobre.
-
-Limitações honestas (lidas com atenção antes de decidir append)
----------------------------------------------------------------
-  • FK por inclusão é heurística: dá falso positivo (duas colunas de código que
-    compartilham domínio sem relação real). Por isso a saída marca confiança e
-    você revisa as candidatas, não as toma como dogma.
-  • Amostragem (max_rows) ORFANA relacionamentos artificialmente. Para um
-    veredito confiável de PK/FK, rode com max_rows=None sobre o dado completo.
-    Com amostra, o resultado é indicativo, não conclusivo — e o relatório diz
-    isso em destaque.
-  • Este módulo SÓ LÊ. Não escreve nada em lugar nenhum.
+Limitações honestas
+-------------------
+  • FK por inclusão DESCOBERTA é heurística (falso positivo de domínios que se
+    sobrepõem). FK DECLARADA não tem esse problema (você informou a relação).
+  • Amostragem (max_rows) ORFANA relacionamentos artificialmente. Para veredito
+    de produção, rode com max_rows=None sobre o dado completo.
+  • Este módulo SÓ LÊ. Não escreve nada.
 
 Uso
 ---
-    from sdv_validate import run_structural_validation
+    from sdv_validate import run_structural_validation, display_validation_report
 
     resultado = run_structural_validation(
-        original_path  = "oci://bkt@ns/onprem-export",   # prefixo OU dict
+        original_path  = "oci://bkt@ns/onprem-export",
         synthetic_path = "oci://bkt@ns/synthetic",
         fmt            = "parquet",
-        max_rows       = None,      # None p/ veredito de produção (recomendado)
-        fk_max_cols    = 1,         # 1 = só FKs de coluna única (rápido)
+        max_rows       = None,
+        specs_config   = specs_config,   # opcional: passa PK/FK declaradas
     )
-
     resultado["veredito"]            # "APROVADO" | "REPROVADO"
     resultado["inconsistencias"]     # DataFrame com todo problema achado
 """
@@ -68,6 +59,7 @@ from __future__ import annotations
 import io
 import os
 import warnings as _warnings
+from collections.abc import Mapping as ABCMapping
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
@@ -123,7 +115,6 @@ def _list_tables(base: str, fmt: str) -> List[str]:
             todos = fs.find(base_norm)
         except FileNotFoundError:
             return []
-        # prefixo relativo ao base, em forma nativa do ocifs (sem oci://)
         nativo = base_norm[len("oci://"):]
         nomes = set()
         for f in todos:
@@ -131,7 +122,6 @@ def _list_tables(base: str, fmt: str) -> List[str]:
             if "/" in rel:
                 nomes.add(rel.split("/")[0])
         return sorted(nomes)
-    # local
     base_norm = os.path.expanduser(base.rstrip("/"))
     if not os.path.isdir(base_norm):
         return []
@@ -147,7 +137,6 @@ def _list_tables(base: str, fmt: str) -> List[str]:
 
 def _read_parquet_parts(path: str, max_rows: Optional[int], seed: int) -> pd.DataFrame:
     """Lê Parquet (pasta de parts OU arquivo único) preservando dtypes nativos."""
-    fmt = "parquet"
     if _is_oci(path):
         fs = _get_oci_fs()
         path_n = str(path).rstrip("/")
@@ -177,7 +166,6 @@ def _read_parquet_parts(path: str, max_rows: Optional[int], seed: int) -> pd.Dat
                 if max_rows and acc >= max_rows:
                     break
         return pd.concat(dfs, ignore_index=True) if len(dfs) > 1 else dfs[0]
-    # local
     p = os.path.expanduser(str(path).rstrip("/"))
     df = pd.read_parquet(p)
     if max_rows and len(df) > max_rows:
@@ -204,14 +192,11 @@ def _canonical_dtype(series: pd.Series) -> str:
     """
     Reduz o dtype a uma classe canônica comparável, tolerando diferenças
     cosméticas que NÃO são erro de sintetização:
-        int8/int16/int32/int64/Int64  -> "integer"
-        float16/32/64                 -> "float"
-        bool/boolean                  -> "boolean"
-        datetime64[*]                 -> "datetime"
-        object/string                 -> "string"
-        category                      -> "string" (categoria é representação)
-    Mantém a distinção que IMPORTA para append: integer != float != string !=
-    datetime != boolean. Um ID que era integer e virou string é flagado.
+        int8/16/32/64/Int64 -> "integer"; float16/32/64 -> "float";
+        bool/boolean -> "boolean"; datetime64[*] -> "datetime";
+        object/string/category -> "string".
+    Mantém a distinção que IMPORTA: integer != float != string != datetime !=
+    boolean. Um ID que era integer e virou string é flagado.
     """
     dt = series.dtype
     if pd.api.types.is_bool_dtype(dt):
@@ -222,7 +207,6 @@ def _canonical_dtype(series: pd.Series) -> str:
         return "float"
     if pd.api.types.is_datetime64_any_dtype(dt):
         return "datetime"
-    # object, string, category -> string
     return "string"
 
 
@@ -257,11 +241,27 @@ def _discover_single_col_pks(df: pd.DataFrame) -> List[str]:
 # ============================================================
 
 def _value_set(series: pd.Series) -> set:
-    """Conjunto de valores não-nulos, normalizado para string para comparar."""
+    """Conjunto de valores não-nulos, normalizado para string."""
     s = series.dropna()
     if len(s) == 0:
         return set()
     return set(s.astype(str).unique())
+
+
+def _value_set_cols(df: pd.DataFrame, cols: List[str]) -> Optional[set]:
+    """
+    Conjunto de valores de uma ou mais colunas (chave composta), como string.
+    Linhas com qualquer coluna nula são descartadas (chave parcial não conta).
+    Retorna None se alguma coluna não existir (caller decide o que fazer).
+    """
+    if any(c not in df.columns for c in cols):
+        return None
+    sub = df[cols].dropna()
+    if len(sub) == 0:
+        return set()
+    if len(cols) == 1:
+        return set(sub[cols[0]].astype(str).unique())
+    return set(sub.astype(str).agg("||".join, axis=1).unique())
 
 
 def _inclusion_ratio(child_vals: set, parent_vals: set) -> float:
@@ -270,6 +270,29 @@ def _inclusion_ratio(child_vals: set, parent_vals: set) -> float:
         return np.nan
     contidos = len(child_vals & parent_vals)
     return contidos / len(child_vals)
+
+
+def _fk_inclusion(
+    child_df: pd.DataFrame, child_cols: List[str],
+    parent_df: pd.DataFrame, parent_cols: List[str],
+) -> Optional[Dict[str, Any]]:
+    """
+    Inclusão de uma FK (simples OU composta) entre dois DataFrames.
+    Retorna dict(incl, orphans, n_child, coverage) ou None se faltar coluna.
+    """
+    cvals = _value_set_cols(child_df, child_cols)
+    pvals = _value_set_cols(parent_df, parent_cols)
+    if cvals is None or pvals is None:
+        return None
+    if not cvals:
+        return {"incl": np.nan, "orphans": 0, "n_child": 0, "coverage": 0.0}
+    inter = len(cvals & pvals)
+    return {
+        "incl": inter / len(cvals),
+        "orphans": len(cvals - pvals),
+        "n_child": len(cvals),
+        "coverage": (inter / len(pvals)) if pvals else 0.0,
+    }
 
 
 def _discover_inclusions(
@@ -281,21 +304,9 @@ def _discover_inclusions(
     min_parent_coverage: float = 0.0,
 ) -> List[Dict[str, Any]]:
     """
-    Descobre FKs candidatas: para cada coluna de cada tabela (filho), testa se
-    seus valores estão contidos nos valores de uma PK candidata de OUTRA tabela
-    (pai). Inclusão >= min_inclusion vira candidata.
-
-    Defesas contra falso positivo (domínios numéricos que se sobrepõem por
-    acaso, ex.: COD_X ⊆ COD_Y só porque ambos são 1..N):
-      • a coluna-filho NÃO pode ser ela mesma uma PK única da própria tabela
-        (uma PK própria raramente é FK de outra);
-      • exige cobertura mínima do pai: a fração de valores DISTINTOS do pai que
-        aparecem no filho (relacionamento real costuma cobrir parte relevante
-        do pai; 1-2 valores coincidentes não);
-      • marca uma 'confianca' qualitativa para revisão humana.
-
-    Conservador de propósito: só considera pai = coluna que é PK candidata
-    (única+não-nula) no original.
+    Descobre FKs candidatas: para cada coluna (filho), testa se seus valores
+    estão contidos nos de uma PK candidata de OUTRA tabela (pai). Conservador:
+    pai = coluna única+não-nula no original. Marca 'confianca' para revisão.
     """
     candidatas: List[Dict[str, Any]] = []
     parent_sets: Dict[Tuple[str, str], set] = {}
@@ -303,12 +314,10 @@ def _discover_inclusions(
         for pcol in pcols:
             parent_sets[(ptab, pcol)] = _value_set(tables[ptab][pcol])
 
-    # conjunto de PKs próprias por tabela (para não tratá-las como filho-FK)
     own_pks = {t: set(cols) for t, cols in pk_candidates.items()}
 
     for child, cdf in tables.items():
         for ccol in cdf.columns:
-            # uma PK única da própria tabela dificilmente é FK de outra
             if ccol in own_pks.get(child, set()):
                 continue
             cvals = _value_set(cdf[ccol])
@@ -322,11 +331,9 @@ def _discover_inclusions(
                 ratio = _inclusion_ratio(cvals, pvals)
                 if ratio is np.nan or ratio < min_inclusion:
                     continue
-                # cobertura do pai: quantos valores do pai o filho referencia
                 cobertura = len(cvals & pvals) / len(pvals) if pvals else 0.0
                 if cobertura < min_parent_coverage:
                     continue
-                # confiança qualitativa
                 if cobertura >= 0.5 and len(cvals) >= 20:
                     conf = "alta"
                 elif cobertura >= 0.2:
@@ -334,16 +341,63 @@ def _discover_inclusions(
                 else:
                     conf = "baixa"
                 candidatas.append({
-                    "child_table": child,
-                    "child_col":   ccol,
-                    "parent_table": ptab,
-                    "parent_col":  pcol,
+                    "child_table": child, "child_col": ccol,
+                    "parent_table": ptab, "parent_col": pcol,
                     "incl_original": round(float(ratio), 4),
                     "n_distinct_child": len(cvals),
                     "parent_coverage": round(float(cobertura), 4),
                     "confianca": conf,
                 })
     return candidatas
+
+
+# ============================================================
+# 4b. Leitura de PK/FK declaradas (specs_config) — opcional
+# ============================================================
+
+def _norm_cols(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        v = value.strip()
+        return [v] if v else []
+    if isinstance(value, (list, tuple)):
+        return [str(c).strip() for c in value if str(c).strip()]
+    return []
+
+
+def _pks_from_config(specs_config: Mapping[str, Mapping]) -> Dict[str, List[str]]:
+    out: Dict[str, List[str]] = {}
+    for name, cfg in specs_config.items():
+        if isinstance(cfg, ABCMapping):
+            pk = _norm_cols(cfg.get("pk_cols"))
+            if pk:
+                out[str(name)] = pk
+    return out
+
+
+def _fks_from_config(specs_config: Mapping[str, Mapping]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for name, cfg in specs_config.items():
+        if not isinstance(cfg, ABCMapping):
+            continue
+        raw = cfg.get("foreign_keys") or cfg.get("fks") or []
+        if isinstance(raw, ABCMapping):
+            raw = [raw]
+        for fk in (raw or []):
+            if not isinstance(fk, ABCMapping):
+                continue
+            cols  = _norm_cols(fk.get("columns"))
+            ptab  = str(fk.get("parent_table")).strip() if fk.get("parent_table") else ""
+            pcols = _norm_cols(fk.get("parent_columns"))
+            if not pcols and ptab and isinstance(specs_config.get(ptab), ABCMapping):
+                pcols = _norm_cols(specs_config[ptab].get("pk_cols"))
+            if cols and ptab and pcols and len(cols) == len(pcols):
+                out.append({
+                    "child_table": str(name), "child_cols": cols,
+                    "parent_table": ptab, "parent_cols": pcols,
+                })
+    return out
 
 
 # ============================================================
@@ -360,94 +414,77 @@ def run_structural_validation(
     min_inclusion: float = 1.0,
     min_distinct_child: int = 5,
     min_parent_coverage: float = 0.05,
+    specs_config: Optional[Mapping[str, Mapping]] = None,
+    discover_undeclared: bool = True,
     seed: int = 42,
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """
     Valida estrutura (tipo) e relacionamentos (PK/FK) do sintético contra o
-    original, sem usar specs_config. Retorna dict com veredito e DataFrames.
+    original. Retorna dict com veredito e DataFrames.
 
-    Parâmetros
-    ----------
-    original_path / synthetic_path : prefixo base (str) — descobre as tabelas
-        automaticamente — OU dict {tabela: caminho}.
-    fmt          : "parquet" (exigido; ver _read_table).
-    max_rows     : None para veredito de produção (recomendado). Com amostra,
-        o resultado de PK/FK é INDICATIVO, não conclusivo.
-    fk_max_cols  : 1 = só FKs de coluna única (padrão, rápido). >1 não
-        implementado aqui (FK composta multiplica o custo combinatório).
-    min_inclusion: limiar de inclusão para considerar uma FK candidata no
-        original (1.0 = inclusão total).
-    min_distinct_child : ignora colunas com menos distintos que isso ao inferir
-        FK (evita ruído de colunas de flag/status).
+    Parâmetros (novos)
+    ------------------
+    specs_config        : opcional. Se fornecido, valida as PK/FK DECLARADAS
+                          (inclusive compostas), marcadas fonte="declarado".
+                          Sem ele, o módulo segue 100% data-driven.
+    discover_undeclared : se True (padrão), também descobre PK/FK pelos dados
+                          (fonte="descoberto"), mesmo com specs_config — para
+                          pegar relacionamentos não declarados. Ponha False para
+                          validar SOMENTE o que você declarou.
+
+    fk_max_cols : 1 = descoberta só de FKs de coluna única (composta DESCOBERTA
+                  não implementada). FK DECLARADA composta funciona normalmente.
 
     Retorna
     -------
-    {
-      "veredito": "APROVADO" | "REPROVADO",
-      "inconsistencias": DataFrame,   # cada linha = 1 problema
-      "tipos": DataFrame,             # comparação de dtype por coluna
-      "pks": DataFrame,               # PK candidata: vale no orig? e no synth?
-      "fks": DataFrame,               # FK candidata: inclusão orig vs synth
-      "tabelas": DataFrame,           # presença/contagem por tabela
-      "amostrado": bool,
-    }
+    dict com: veredito, inconsistencias, tipos, pks, fks, tabelas, amostrado,
+              n_criticos. As tabelas pks/fks têm coluna 'fonte' (declarado|descoberto).
     """
-    if fk_max_cols != 1:
+    if fk_max_cols != 1 and discover_undeclared:
         raise NotImplementedError(
-            "fk_max_cols>1 (FK composta) não implementado nesta versão. "
-            "FK de coluna única cobre o caso dominante; composta exige busca "
-            "combinatória cara e deve ser tratada à parte."
+            "fk_max_cols>1 (descoberta de FK composta) não implementado. "
+            "FK composta DECLARADA (via specs_config) funciona; para descoberta, "
+            "mantenha fk_max_cols=1."
         )
 
     # ── 1. descobrir e carregar tabelas (dos dois lados) ──
     if isinstance(original_path, str):
-        orig_tabs = _list_tables(original_path, fmt)
-        orig_paths = {t: _join_path(original_path, t) for t in orig_tabs}
+        orig_paths = {t: _join_path(original_path, t) for t in _list_tables(original_path, fmt)}
     else:
         orig_paths = dict(original_path)
-
     if isinstance(synthetic_path, str):
-        synth_tabs = _list_tables(synthetic_path, fmt)
-        synth_paths = {t: _join_path(synthetic_path, t) for t in synth_tabs}
+        synth_paths = {t: _join_path(synthetic_path, t) for t in _list_tables(synthetic_path, fmt)}
     else:
         synth_paths = dict(synthetic_path)
 
     if verbose:
         print(f"Tabelas no original:  {sorted(orig_paths)}")
         print(f"Tabelas no sintético: {sorted(synth_paths)}")
+        if specs_config:
+            print(f"Modo DECLARADO ativo (specs_config) | descoberta={'ON' if discover_undeclared else 'OFF'}")
 
     inconsist: List[Dict[str, Any]] = []
 
-    # ── 2. presença de tabelas (estrutural de alto nível) ──
+    # ── 2. presença de tabelas ──
     so, ss = set(orig_paths), set(synth_paths)
     tab_rows: List[Dict[str, Any]] = []
     for t in sorted(so | ss):
         no_orig, no_synth = t in so, t in ss
         if no_orig and not no_synth:
-            inconsist.append({
-                "severidade": "CRÍTICO", "tipo": "TABELA_AUSENTE",
-                "objeto": t,
-                "detalhe": "tabela existe no original mas NÃO no sintético",
-            })
+            inconsist.append({"severidade": "CRÍTICO", "tipo": "TABELA_AUSENTE",
+                              "objeto": t, "detalhe": "tabela existe no original mas NÃO no sintético"})
         elif no_synth and not no_orig:
-            inconsist.append({
-                "severidade": "ALERTA", "tipo": "TABELA_EXTRA",
-                "objeto": t,
-                "detalhe": "tabela existe no sintético mas NÃO no original",
-            })
+            inconsist.append({"severidade": "ALERTA", "tipo": "TABELA_EXTRA",
+                              "objeto": t, "detalhe": "tabela existe no sintético mas NÃO no original"})
         tab_rows.append({"tabela": t, "no_original": no_orig, "no_sintetico": no_synth})
 
     comuns = sorted(so & ss)
     if not comuns:
-        df_inc = pd.DataFrame(inconsist)
         return {
-            "veredito": "REPROVADO",
-            "inconsistencias": df_inc,
-            "tipos": pd.DataFrame(), "pks": pd.DataFrame(),
-            "fks": pd.DataFrame(),
-            "tabelas": pd.DataFrame(tab_rows),
-            "amostrado": bool(max_rows),
+            "veredito": "REPROVADO", "inconsistencias": pd.DataFrame(inconsist),
+            "tipos": pd.DataFrame(), "pks": pd.DataFrame(), "fks": pd.DataFrame(),
+            "tabelas": pd.DataFrame(tab_rows), "amostrado": bool(max_rows), "n_criticos": 0,
         }
 
     real: Dict[str, pd.DataFrame] = {}
@@ -465,110 +502,164 @@ def run_structural_validation(
         rcols, scols = list(real[t].columns), list(synth[t].columns)
         for c in rcols:
             if c not in scols:
-                inconsist.append({
-                    "severidade": "CRÍTICO", "tipo": "COLUNA_AUSENTE",
-                    "objeto": f"{t}.{c}",
-                    "detalhe": "coluna existe no original mas NÃO no sintético",
-                })
-                tipo_rows.append({"tabela": t, "coluna": c,
-                                  "tipo_original": _canonical_dtype(real[t][c]),
+                inconsist.append({"severidade": "CRÍTICO", "tipo": "COLUNA_AUSENTE",
+                                  "objeto": f"{t}.{c}", "detalhe": "coluna existe no original mas NÃO no sintético"})
+                tipo_rows.append({"tabela": t, "coluna": c, "tipo_original": _canonical_dtype(real[t][c]),
                                   "tipo_sintetico": "—", "status": "AUSENTE"})
                 continue
             to = _canonical_dtype(real[t][c])
             ts = _canonical_dtype(synth[t][c])
             ok = (to == ts)
             if not ok:
-                inconsist.append({
-                    "severidade": "CRÍTICO", "tipo": "TIPO_DIVERGENTE",
-                    "objeto": f"{t}.{c}",
-                    "detalhe": f"tipo original={to} mas sintético={ts}",
-                })
+                inconsist.append({"severidade": "CRÍTICO", "tipo": "TIPO_DIVERGENTE",
+                                  "objeto": f"{t}.{c}", "detalhe": f"tipo original={to} mas sintético={ts}"})
             tipo_rows.append({"tabela": t, "coluna": c, "tipo_original": to,
-                              "tipo_sintetico": ts,
-                              "status": "OK" if ok else "DIVERGENTE"})
+                              "tipo_sintetico": ts, "status": "OK" if ok else "DIVERGENTE"})
         for c in scols:
             if c not in rcols:
-                inconsist.append({
-                    "severidade": "ALERTA", "tipo": "COLUNA_EXTRA",
-                    "objeto": f"{t}.{c}",
-                    "detalhe": "coluna existe no sintético mas NÃO no original",
-                })
+                inconsist.append({"severidade": "ALERTA", "tipo": "COLUNA_EXTRA",
+                                  "objeto": f"{t}.{c}", "detalhe": "coluna existe no sintético mas NÃO no original"})
                 tipo_rows.append({"tabela": t, "coluna": c, "tipo_original": "—",
-                                  "tipo_sintetico": _canonical_dtype(synth[t][c]),
-                                  "status": "EXTRA"})
+                                  "tipo_sintetico": _canonical_dtype(synth[t][c]), "status": "EXTRA"})
 
-    # ── 4. PK descoberta no ORIGINAL, re-testada no SINTÉTICO ──
-    pk_candidates_orig: Dict[str, List[str]] = {
-        t: _discover_single_col_pks(real[t]) for t in comuns
-    }
+    # ── 4. PK: declarada (se specs_config) + descoberta no ORIGINAL ──
+    pk_candidates_orig: Dict[str, List[str]] = {t: _discover_single_col_pks(real[t]) for t in comuns}
+    declared_pks = _pks_from_config(specs_config) if specs_config else {}
     pk_rows: List[Dict[str, Any]] = []
-    for t in comuns:
-        for c in pk_candidates_orig[t]:
-            if c not in synth[t].columns:
-                continue  # já reportado como COLUNA_AUSENTE
-            ok_s, nulos_s, dup_s = _is_unique_notnull(synth[t], [c])
-            if not ok_s:
-                inconsist.append({
-                    "severidade": "CRÍTICO", "tipo": "PK_QUEBRADA",
-                    "objeto": f"{t}.{c}",
-                    "detalhe": (f"coluna é PK no original (única+não-nula) mas no "
-                                f"sintético tem {nulos_s} nulo(s) e {dup_s} "
-                                f"duplicado(s)"),
-                })
-            pk_rows.append({
-                "tabela": t, "coluna_pk": c,
-                "pk_no_original": True,
-                "pk_no_sintetico": ok_s,
-                "nulos_synth": nulos_s, "duplicados_synth": dup_s,
-                "status": "OK" if ok_s else "QUEBRADA",
-            })
+    seen_pk: set = set()
 
-    # ── 5. FK descoberta por inclusão no ORIGINAL, re-testada no SINTÉTICO ──
-    inclusions = _discover_inclusions(
-        real, pk_candidates_orig,
-        min_inclusion=min_inclusion, min_distinct_child=min_distinct_child,
-        min_parent_coverage=min_parent_coverage,
-    )
+    def _registra_pk(t: str, cols: List[str], fonte: str) -> None:
+        chave = (t, ",".join(cols))
+        if chave in seen_pk:
+            return
+        seen_pk.add(chave)
+        existe_orig = all(c in real[t].columns for c in cols)
+        ok_o = _is_unique_notnull(real[t], cols)[0] if existe_orig else False
+        if any(c not in synth[t].columns for c in cols):
+            pk_rows.append({"tabela": t, "coluna_pk": ",".join(cols), "fonte": fonte,
+                            "pk_no_original": ok_o, "pk_no_sintetico": False,
+                            "nulos_synth": -1, "duplicados_synth": -1, "status": "QUEBRADA"})
+            return
+        ok_s, nulos_s, dup_s = _is_unique_notnull(synth[t], cols)
+        if not ok_s and ok_o:  # só é "quebra" se ERA PK no original
+            inconsist.append({"severidade": "CRÍTICO", "tipo": "PK_QUEBRADA",
+                              "objeto": f"{t}.{','.join(cols)}",
+                              "detalhe": (f"é PK ({fonte}) no original (única+não-nula) mas no "
+                                          f"sintético tem {nulos_s} nulo(s) e {dup_s} duplicado(s)")})
+        pk_rows.append({"tabela": t, "coluna_pk": ",".join(cols), "fonte": fonte,
+                        "pk_no_original": ok_o, "pk_no_sintetico": ok_s,
+                        "nulos_synth": nulos_s, "duplicados_synth": dup_s,
+                        "status": "OK" if ok_s else "QUEBRADA"})
+
+    # 4a. PKs DECLARADAS (checadas também no original como sanidade)
+    for t, cols in declared_pks.items():
+        if t not in comuns:
+            continue
+        if any(c not in real[t].columns for c in cols):
+            inconsist.append({"severidade": "ALERTA", "tipo": "PK_DECLARADA_COLUNA_AUSENTE",
+                              "objeto": f"{t}.{','.join(cols)}",
+                              "detalhe": "PK declarada referencia coluna inexistente no original"})
+            continue
+        ok_o, nul_o, dup_o = _is_unique_notnull(real[t], cols)
+        if not ok_o:
+            inconsist.append({"severidade": "ALERTA", "tipo": "PK_DECLARADA_INVALIDA_ORIGINAL",
+                              "objeto": f"{t}.{','.join(cols)}",
+                              "detalhe": (f"PK declarada NÃO é única+não-nula no próprio original "
+                                          f"({nul_o} nulo(s), {dup_o} duplicado(s)); declaração ou "
+                                          "dado de origem inconsistente")})
+        _registra_pk(t, cols, "declarado")
+
+    # 4b. PKs DESCOBERTAS (não declaradas)
+    if discover_undeclared:
+        for t in comuns:
+            for c in pk_candidates_orig[t]:
+                _registra_pk(t, [c], "descoberto")
+
+    # ── 5. FK: declarada (se specs_config) + descoberta por inclusão ──
     fk_rows: List[Dict[str, Any]] = []
-    for inc in inclusions:
-        child, ccol = inc["child_table"], inc["child_col"]
-        ptab, pcol  = inc["parent_table"], inc["parent_col"]
-        # precisa existir dos dois lados no sintético
-        if ccol not in synth.get(child, pd.DataFrame()).columns:
-            continue
-        if pcol not in synth.get(ptab, pd.DataFrame()).columns:
-            continue
-        cvals_s = _value_set(synth[child][ccol])
-        pvals_s = _value_set(synth[ptab][pcol])
-        ratio_s = _inclusion_ratio(cvals_s, pvals_s)
-        orfaos = (len(cvals_s - pvals_s) if cvals_s else 0)
-        quebrou = (ratio_s is np.nan) or (ratio_s < inc["incl_original"] - 1e-9)
-        if quebrou:
-            inconsist.append({
-                "severidade": "CRÍTICO", "tipo": "FK_DEGRADADA",
-                "objeto": f"{child}.{ccol} -> {ptab}.{pcol}",
-                "detalhe": (f"inclusão caiu de {inc['incl_original']:.4f} (original) "
-                            f"para {ratio_s if ratio_s is not np.nan else float('nan'):.4f} "
-                            f"(sintético): {orfaos} valor(es) órfão(s) no filho"),
+    declared_fk_keys: set = set()
+
+    # 5a. FKs DECLARADAS (inclusão no original e no sintético; composta OK)
+    if specs_config:
+        for d in _fks_from_config(specs_config):
+            child, ccols = d["child_table"], d["child_cols"]
+            ptab,  pcols = d["parent_table"], d["parent_cols"]
+            label = f"{child}.{','.join(ccols)} -> {ptab}.{','.join(pcols)}"
+            if child not in comuns or ptab not in comuns:
+                inconsist.append({"severidade": "ALERTA", "tipo": "FK_DECLARADA_TABELA_AUSENTE",
+                                  "objeto": label, "detalhe": "FK declarada referencia tabela ausente nos dados"})
+                continue
+            base = _fk_inclusion(real[child], ccols, real[ptab], pcols)
+            synv = _fk_inclusion(synth[child], ccols, synth[ptab], pcols)
+            if base is None or synv is None:
+                inconsist.append({"severidade": "ALERTA", "tipo": "FK_DECLARADA_COLUNA_AUSENTE",
+                                  "objeto": label, "detalhe": "FK declarada referencia coluna ausente em um dos lados"})
+                continue
+            incl_o, incl_s = base["incl"], synv["incl"]
+            if not np.isnan(incl_o) and incl_o < 1.0 - 1e-9:
+                inconsist.append({"severidade": "ALERTA", "tipo": "FK_DECLARADA_ORFAOS_ORIGINAL",
+                                  "objeto": label,
+                                  "detalhe": (f"FK declarada já tem inclusão {incl_o:.4f} no próprio "
+                                              f"original ({base['orphans']} órfão(s)); pode ser FK "
+                                              "nullable ou declaração imprecisa")})
+            quebrou = bool(np.isnan(incl_s)) or (not np.isnan(incl_o) and incl_s < incl_o - 1e-9)
+            if quebrou:
+                _is = f"{incl_s:.4f}" if not np.isnan(incl_s) else "nan"
+                _io = f"{incl_o:.4f}" if not np.isnan(incl_o) else "nan"
+                inconsist.append({"severidade": "CRÍTICO", "tipo": "FK_DEGRADADA",
+                                  "objeto": label,
+                                  "detalhe": f"inclusão caiu de {_io} (original) para {_is} (sintético): {synv['orphans']} órfão(s)"})
+            fk_rows.append({
+                "fk": label,
+                "incl_original": (round(float(incl_o), 4) if not np.isnan(incl_o) else np.nan),
+                "incl_sintetico": (round(float(incl_s), 4) if not np.isnan(incl_s) else np.nan),
+                "valores_orfaos_synth": synv["orphans"],
+                "n_distinct_child": synv["n_child"],
+                "parent_coverage": round(float(synv["coverage"]), 4),
+                "confianca": "declarado", "fonte": "declarado",
+                "status": "DEGRADADA" if quebrou else "OK",
             })
-        fk_rows.append({
-            "fk": f"{child}.{ccol} -> {ptab}.{pcol}",
-            "incl_original": inc["incl_original"],
-            "incl_sintetico": (round(float(ratio_s), 4)
-                               if ratio_s is not np.nan else np.nan),
-            "valores_orfaos_synth": orfaos,
-            "n_distinct_child": inc["n_distinct_child"],
-            "parent_coverage": inc["parent_coverage"],
-            "confianca": inc["confianca"],
-            "status": "DEGRADADA" if quebrou else "OK",
-        })
+            declared_fk_keys.add((child, tuple(ccols), ptab, tuple(pcols)))
+
+    # 5b. FKs DESCOBERTAS por inclusão (não declaradas)
+    if discover_undeclared:
+        for inc in _discover_inclusions(real, pk_candidates_orig,
+                                        min_inclusion=min_inclusion,
+                                        min_distinct_child=min_distinct_child,
+                                        min_parent_coverage=min_parent_coverage):
+            child, ccol = inc["child_table"], inc["child_col"]
+            ptab, pcol  = inc["parent_table"], inc["parent_col"]
+            if (child, (ccol,), ptab, (pcol,)) in declared_fk_keys:
+                continue
+            if ccol not in synth.get(child, pd.DataFrame()).columns:
+                continue
+            if pcol not in synth.get(ptab, pd.DataFrame()).columns:
+                continue
+            cvals_s = _value_set(synth[child][ccol])
+            pvals_s = _value_set(synth[ptab][pcol])
+            ratio_s = _inclusion_ratio(cvals_s, pvals_s)
+            orfaos = (len(cvals_s - pvals_s) if cvals_s else 0)
+            quebrou = (ratio_s is np.nan) or (ratio_s < inc["incl_original"] - 1e-9)
+            if quebrou:
+                inconsist.append({"severidade": "CRÍTICO", "tipo": "FK_DEGRADADA",
+                                  "objeto": f"{child}.{ccol} -> {ptab}.{pcol}",
+                                  "detalhe": (f"inclusão caiu de {inc['incl_original']:.4f} (original) "
+                                              f"para {ratio_s if ratio_s is not np.nan else float('nan'):.4f} "
+                                              f"(sintético): {orfaos} órfão(s)")})
+            fk_rows.append({
+                "fk": f"{child}.{ccol} -> {ptab}.{pcol}",
+                "incl_original": inc["incl_original"],
+                "incl_sintetico": (round(float(ratio_s), 4) if ratio_s is not np.nan else np.nan),
+                "valores_orfaos_synth": orfaos,
+                "n_distinct_child": inc["n_distinct_child"],
+                "parent_coverage": inc["parent_coverage"],
+                "confianca": inc["confianca"], "fonte": "descoberto",
+                "status": "DEGRADADA" if quebrou else "OK",
+            })
 
     # ── 6. veredito ──
     df_inc = pd.DataFrame(inconsist)
-    criticos = (
-        int((df_inc["severidade"] == "CRÍTICO").sum())
-        if len(df_inc) else 0
-    )
+    criticos = int((df_inc["severidade"] == "CRÍTICO").sum()) if len(df_inc) else 0
     veredito = "REPROVADO" if criticos > 0 else "APROVADO"
 
     return {
@@ -611,7 +702,7 @@ def display_validation_report(resultado: Mapping[str, Any]) -> None:
             sty = sty.map(_bg, subset=[status_col])
         return sty
 
-    display(Markdown("# 🔒 Validação Estrutural & Relacional (data-driven)"))
+    display(Markdown("# 🔒 Validação Estrutural & Relacional"))
 
     veredito = resultado["veredito"]
     cor = _GREEN if veredito == "APROVADO" else _RED
@@ -619,25 +710,22 @@ def display_validation_report(resultado: Mapping[str, Any]) -> None:
     display(Markdown(
         f"<div style='background:{cor};color:white;padding:14px 18px;"
         f"border-radius:8px;font-size:20px;font-weight:bold'>"
-        f"VEREDITO: {veredito} &nbsp;·&nbsp; {n_crit} inconsistência(s) crítica(s)"
-        f"</div>"
+        f"VEREDITO: {veredito} &nbsp;·&nbsp; {n_crit} inconsistência(s) crítica(s)</div>"
     ))
 
     if resultado.get("amostrado"):
         display(Markdown(
             "> ⚠️ **AMOSTRADO (max_rows definido).** O veredito de PK/FK é "
             "**INDICATIVO, não conclusivo**: amostrar tabelas independentemente "
-            "orfana FKs que existem no dado completo, gerando FK_DEGRADADA falsa. "
-            "**Para decidir o append em produção, rode com `max_rows=None`.**"
+            "orfana FKs que existem no dado completo. **Para decidir o append em "
+            "produção, rode com `max_rows=None`.**"
         ))
 
-    # inconsistências primeiro — é o que importa
     _sec("Inconsistências encontradas", "🚨")
     df_inc = resultado["inconsistencias"]
     if df_inc is not None and len(df_inc):
         ordem = {"CRÍTICO": 0, "ALERTA": 1}
-        df_inc = df_inc.assign(_o=df_inc["severidade"].map(ordem)).sort_values(
-            ["_o", "tipo"]).drop(columns="_o")
+        df_inc = df_inc.assign(_o=df_inc["severidade"].map(ordem)).sort_values(["_o", "tipo"]).drop(columns="_o")
         def _bg_sev(v):
             c = _RED if str(v) == "CRÍTICO" else _AMBER
             return f"background-color:{c};color:white;font-weight:bold"
@@ -649,61 +737,51 @@ def display_validation_report(resultado: Mapping[str, Any]) -> None:
     else:
         display(Markdown(
             f"<span style='color:{_GREEN};font-weight:bold'>Nenhuma inconsistência. "
-            "Estrutura e relacionamentos inferidos do original foram preservados "
-            "no sintético.</span>"
+            "Estrutura e relacionamentos (declarados e/ou inferidos) foram "
+            "preservados no sintético.</span>"
         ))
 
     _sec("Tipos de dado (original vs sintético)", "🧬")
     df_t = resultado["tipos"]
     if df_t is not None and len(df_t):
         ruins = df_t[df_t["status"] != "OK"]
-        display(Markdown(
-            f"{len(df_t)} coluna(s) comparada(s) · "
-            f"**{len(ruins)}** divergente(s)/ausente(s)/extra(s)."
-        ))
-        mostrar = ruins if len(ruins) else df_t
-        display(_style(mostrar, "status"))
+        display(Markdown(f"{len(df_t)} coluna(s) comparada(s) · **{len(ruins)}** divergente(s)/ausente(s)/extra(s)."))
+        display(_style(ruins if len(ruins) else df_t, "status"))
     else:
         display(Markdown("_Sem colunas comparadas._"))
 
-    _sec("Chaves primárias descobertas", "🔑")
+    _sec("Chaves primárias (declaradas + descobertas)", "🔑")
     df_pk = resultado["pks"]
     if df_pk is not None and len(df_pk):
         display(Markdown(
-            "Cada linha é uma coluna que é **única + não-nula no ORIGINAL** "
-            "(logo, PK de fato). `pk_no_sintetico=False` significa que o "
-            "sintetizador **quebrou** uma chave que existia."
+            "`fonte`: **declarado** (do specs_config) ou **descoberto** (única+"
+            "não-nula no original). `pk_no_sintetico=False` = o sintetizador "
+            "**quebrou** uma chave que valia no original."
         ))
         display(_style(df_pk, "status"))
     else:
-        display(Markdown("_Nenhuma PK de coluna única detectada no original._"))
+        display(Markdown("_Nenhuma PK detectada/declarada._"))
 
-    _sec("Chaves estrangeiras descobertas (por inclusão)", "🔗")
+    _sec("Chaves estrangeiras (declaradas + descobertas por inclusão)", "🔗")
     df_fk = resultado["fks"]
     if df_fk is not None and len(df_fk):
         display(Markdown(
-            "Cada linha é uma relação de **inclusão total observada no ORIGINAL** "
-            "(valores do filho ⊆ chave do pai) — uma FK de fato, mesmo que "
-            "ninguém a tenha declarado. `incl_sintetico < incl_original` = a "
-            "sintetização **degradou** o relacionamento (surgiram órfãos)."
-        ))
-        display(Markdown(
-            "> ℹ️ Inclusão é heurística: pode haver falso positivo (colunas de "
-            "código que compartilham domínio). Revise as candidatas; o que importa "
-            "é nenhuma cair do original para o sintético."
+            "`fonte`: **declarado** (do specs_config — confiável) ou **descoberto** "
+            "(inclusão inferida — heurística, pode ter falso positivo). "
+            "`incl_sintetico < incl_original` = relacionamento **degradado** (órfãos)."
         ))
         display(_style(df_fk, "status"))
     else:
-        display(Markdown("_Nenhuma relação de inclusão detectada no original._"))
+        display(Markdown("_Nenhuma FK declarada/detectada._"))
 
 
 # from sdv_validate import run_structural_validation, display_validation_report
-
+#
 # resultado = run_structural_validation(
 #     original_path  = "oci://oci-st-blc-engordai-qab-n@gr97zovfhcmu/onprem-export",
 #     synthetic_path = "oci://oci-st-blc-engordai-qab-n@gr97zovfhcmu/synthetic",
 #     fmt            = "parquet",
-#     max_rows       = None,      # veredito de produção
+#     max_rows       = None,           # veredito de produção
+#     specs_config   = specs_config,   # opcional: passa PK/FK declaradas
 # )
-
-# display_validation_report(resultado)   # render inline; inconsistências primeiro
+# display_validation_report(resultado)

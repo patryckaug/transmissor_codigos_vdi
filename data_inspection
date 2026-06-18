@@ -1,0 +1,224 @@
+# -*- coding: utf-8 -*-
+"""
+sdv_inspect.py
+==============
+
+Inspeção VISUAL — amostra de linhas (head) do ORIGINAL e do SINTÉTICO lado a
+lado, tabela por tabela, para conferência humana.
+
+Complementa (não substitui) o sdv_validate. O validador dá o veredito
+numérico; aqui você bate o olho na FORMA do dado.
+
+Princípio honesto de leitura
+----------------------------
+O sintético NÃO deve bater linha-a-linha com o original — se batesse, seria
+cópia, não síntese. As duas amostras são INDEPENDENTES e aparecem lado a lado
+só para você inspecionar a *forma*, não para comparar valores registro a
+registro. O que procurar:
+
+  • ordem e nomes das colunas iguais?
+  • um código '0001' virou 1 (perdeu zero à esquerda)?
+  • um CPF/ID string virou float com '.0'?
+  • uma data virou inteiro/string?
+  • um campo numérico ganhou lixo, negativo impossível, NaN onde não havia?
+
+A linha de dtype embaixo de cada coluna é onde mora a corrupção de formato
+que o olho pega e o dtype canônico às vezes não.
+
+Uso
+---
+    from sdv_inspect import display_head_comparison
+
+    display_head_comparison(
+        original_path  = "oci://bkt@ns/onprem-export",   # prefixo OU dict
+        synthetic_path = "oci://bkt@ns/synthetic",
+        fmt            = "parquet",
+        n_rows         = 8,        # linhas por amostra
+        random_sample  = False,    # True para amostra aleatória
+        max_cols       = None,     # limita colunas exibidas (None = todas)
+    )
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Mapping, Optional, Union
+
+import pandas as pd
+
+# Reaproveita a leitura OCI/Parquet e a descoberta de tabelas já testadas.
+from sdv_validate import (
+    _is_oci, _join_path, _list_tables, _read_table, _canonical_dtype,
+)
+
+_NAVY  = "#1E2761"
+_TEAL  = "#0F766E"
+_GREEN = "#15803D"
+_RED   = "#B91C1C"
+_AMBER = "#B45309"
+_LIGHT = "#F0F4FF"
+
+
+def _head(df: pd.DataFrame, n: int, random_sample: bool, seed: int) -> pd.DataFrame:
+    if random_sample and len(df) > n:
+        return df.sample(n=n, random_state=seed).reset_index(drop=True)
+    return df.head(n).reset_index(drop=True)
+
+
+def _style_head(df: pd.DataFrame, accent: str) -> "pd.io.formats.style.Styler":
+    """Estiliza um head: header colorido + linha de dtype sob o nome."""
+    # monta cabeçalho de dois níveis: nome da coluna + dtype canônico
+    df2 = df.copy()
+    df2.columns = pd.MultiIndex.from_tuples(
+        [(c, _canonical_dtype(df[c])) for c in df.columns]
+    )
+    return (
+        df2.style
+        .set_table_styles([
+            {"selector": "th.col_heading.level0",
+             "props": f"background:{accent};color:white;padding:5px 8px;text-align:left"},
+            {"selector": "th.col_heading.level1",
+             "props": f"background:{_LIGHT};color:{accent};font-weight:normal;"
+                      "font-style:italic;padding:2px 8px;text-align:left;font-size:11px"},
+            {"selector": "th.row_heading",
+             "props": f"background:{accent};color:white;padding:5px 8px"},
+            {"selector": "td", "props": "padding:4px 8px;font-family:monospace;font-size:12px"},
+            {"selector": "tr:nth-child(even) td", "props": f"background:{_LIGHT}"},
+        ])
+    )
+
+
+def display_head_comparison(
+    *,
+    original_path: "Union[str, Mapping[str, str]]",
+    synthetic_path: "Union[str, Mapping[str, str]]",
+    fmt: str = "parquet",
+    n_rows: int = 8,
+    random_sample: bool = False,
+    max_cols: Optional[int] = None,
+    max_rows_read: Optional[int] = 10_000,
+    seed: int = 42,
+    verbose: bool = True,
+) -> None:
+    """
+    Exibe head do original e do sintético lado a lado, por tabela em comum.
+
+    Parâmetros
+    ----------
+    original_path / synthetic_path : prefixo base (str, descobre tabelas) OU
+        dict {tabela: caminho}.
+    fmt           : "parquet".
+    n_rows        : quantas linhas mostrar em cada amostra.
+    random_sample : False = primeiras n_rows (determinístico, fácil reabrir);
+                    True = amostra aleatória.
+    max_cols      : limita o nº de colunas exibidas (None = todas). Útil em
+                    tabelas muito largas para caber na tela.
+    max_rows_read : quantas linhas LER de cada part para extrair a amostra.
+                    Só afeta de quais linhas o head é tirado — não é veredito,
+                    é inspeção. Mantém a leitura barata. None = lê tudo.
+    """
+    from IPython.display import display, Markdown, HTML
+
+    # ── descobrir tabelas em comum ──
+    if isinstance(original_path, str):
+        orig_paths = {t: _join_path(original_path, t)
+                      for t in _list_tables(original_path, fmt)}
+    else:
+        orig_paths = dict(original_path)
+    if isinstance(synthetic_path, str):
+        synth_paths = {t: _join_path(synthetic_path, t)
+                       for t in _list_tables(synthetic_path, fmt)}
+    else:
+        synth_paths = dict(synthetic_path)
+
+    comuns = sorted(set(orig_paths) & set(synth_paths))
+
+    display(Markdown("# 👁️ Inspeção Visual — Original vs Sintético (head lado a lado)"))
+    display(Markdown(
+        "> **Como ler:** as duas amostras são **independentes** — não procure "
+        "valores iguais linha a linha (isso seria cópia, não síntese). Olhe a "
+        "**forma**: ordem/nomes das colunas, formato dos códigos (zero à "
+        "esquerda?), datas com cara de data, IDs sem `.0`, ausência de lixo/NaN "
+        "inesperado. O *tipo* de cada coluna aparece em itálico sob o nome."
+    ))
+
+    so, ss = set(orig_paths), set(synth_paths)
+    if so - ss:
+        display(Markdown(f"> ⚠️ Só no original (não exibidas): `{sorted(so - ss)}`"))
+    if ss - so:
+        display(Markdown(f"> ⚠️ Só no sintético (não exibidas): `{sorted(ss - so)}`"))
+    if not comuns:
+        display(Markdown("> ❌ Nenhuma tabela em comum para inspecionar."))
+        return
+
+    for t in comuns:
+        if verbose:
+            print(f"Lendo {t}...")
+        try:
+            r = _read_table(orig_paths[t], fmt, max_rows_read, seed)
+            s = _read_table(synth_paths[t], fmt, max_rows_read, seed)
+        except Exception as exc:
+            display(Markdown(f"---\n### 📑 `{t}`"))
+            display(Markdown(f"> ❌ Falha ao ler: `{exc}`"))
+            continue
+
+        display(Markdown(f"---\n### 📑 `{t}`"))
+
+        # bandeira de colunas divergentes (nome ou tipo) — guia o olho
+        rcols, scols = list(r.columns), list(s.columns)
+        só_orig  = [c for c in rcols if c not in scols]
+        só_synth = [c for c in scols if c not in rcols]
+        tipo_div = [
+            c for c in rcols if c in scols
+            and _canonical_dtype(r[c]) != _canonical_dtype(s[c])
+        ]
+        flags = []
+        if só_orig:
+            flags.append(f"colunas só no original: `{só_orig}`")
+        if só_synth:
+            flags.append(f"colunas só no sintético: `{só_synth}`")
+        if tipo_div:
+            flags.append(f"**tipo divergente**: `{tipo_div}`")
+        if flags:
+            display(Markdown("> 🔎 " + " &nbsp;·&nbsp; ".join(flags)))
+
+        # limitar colunas se pedido (mostra as em comum primeiro)
+        cols_comuns = [c for c in rcols if c in scols]
+        if max_cols is not None and len(cols_comuns) > max_cols:
+            cols_view = cols_comuns[:max_cols]
+            display(Markdown(
+                f"> _Exibindo {max_cols} de {len(cols_comuns)} colunas em comum "
+                f"(use `max_cols=None` para todas)._"
+            ))
+        else:
+            cols_view = cols_comuns
+
+        r_view = _head(r[cols_view], n_rows, random_sample, seed)
+        s_view = _head(s[cols_view], n_rows, random_sample, seed)
+
+        # rótulos de volume
+        amostra_txt = "aleatória" if random_sample else "primeiras linhas"
+        meta = (
+            f"<div style='display:flex;gap:24px;margin:6px 0 10px 0;font-size:13px'>"
+            f"<span style='color:{_NAVY};font-weight:bold'>ORIGINAL</span>"
+            f"<span>amostra: {amostra_txt}</span></div>"
+        )
+        display(HTML(meta))
+        display(_style_head(r_view, _NAVY))
+
+        meta_s = (
+            f"<div style='display:flex;gap:24px;margin:12px 0 10px 0;font-size:13px'>"
+            f"<span style='color:{_TEAL};font-weight:bold'>SINTÉTICO</span>"
+            f"<span>amostra: {amostra_txt}</span></div>"
+        )
+        display(HTML(meta_s))
+        display(_style_head(s_view, _TEAL))
+
+
+# from sdv_inspect import display_head_comparison
+
+# display_head_comparison(
+#     original_path  = "oci://oci-st-blc-engordai-qab-n@gr97zovfhcmu/onprem-export",
+#     synthetic_path = "oci://oci-st-blc-engordai-qab-n@gr97zovfhcmu/synthetic",
+#     fmt            = "parquet",
+#     n_rows         = 8,
+# )

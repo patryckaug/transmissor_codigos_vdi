@@ -1,0 +1,15 @@
+SELECT  ac.constraint_name,
+        ac.table_name        AS tabela_filha,
+        acc.column_name      AS coluna_fk,
+        ac.r_constraint_name,
+        rpk.table_name       AS tabela_pai,
+        rpk.column_name      AS coluna_pk_pai
+FROM    all_constraints ac
+JOIN    all_cons_columns acc
+        ON  ac.constraint_name = acc.constraint_name
+        AND ac.owner           = acc.owner
+JOIN    all_cons_columns rpk
+        ON  ac.r_constraint_name = rpk.constraint_name
+        AND ac.owner             = rpk.owner
+WHERE   ac.constraint_name = 'JUR_FLUT_CONDICAO_IF_FK'
+ORDER BY acc.position;

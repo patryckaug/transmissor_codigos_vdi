@@ -1,0 +1,21 @@
+from synthetic_multitable_spark_v3 import (
+    get_engorda_env,
+    load_specs,
+    engorda,
+)
+
+config = get_engorda_env()
+specs  = load_specs(spark, config["DATAGEN_SPECS_URI"])
+
+engorda(
+    spark,
+    config,
+    specs,
+    scale_factor          = 1.0,   # sem multiplicar — limit já controla volume
+    seed                  = 42,
+    continue_on_error     = False,  # primeiro erro sobe limpo
+    limit                 = 10_000,
+    pk_offset             = None,
+    pk_safety_band        = None,
+    dt_vencimento_prazo_dias = None,
+)

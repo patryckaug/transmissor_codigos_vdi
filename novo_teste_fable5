@@ -47,6 +47,29 @@ contagem preservada, sem NULL artificial, integridade fechada.
   7. Guardas de schema (_fk_colunas_ok) nos passes de amostragem e
      pós-síntese: spec com coluna inexistente vira warning auditável em vez
      de AnalysisException no meio do job.
+  8. (v6.1) Consistência de snapshot e tradução pós-bind:
+     bind_shared_key_children congela (localCheckpoint) as chaves do pai e o
+     pareamento — o rebind numera por posição sobre planos com shuffle, cuja
+     ordem não é estável entre avaliações; sem congelar, o gate/gravação
+     podiam enxergar um pareamento DIFERENTE do verificado (órfãos fantasma,
+     ex.: "286 órfãs" em IDENTIFICACAO_ISPB -> PESSOA_JURIDICA). O bind
+     também devolve o mapa chave_antiga -> chave_nova e o novo passe
+     remapeia_filhas_pos_bind TRADUZ as FKs das filhas dos pais rebindados
+     (ex.: USUARIO/PESSOA_JURIDICA rebindadas p/ chaves de ENTIDADE) — antes
+     todas essas FKs (*_ATUALIZ -> USUARIO etc.) viravam órfãs e eram
+     anuladas em massa. null_orphan_fks materializa o que altera.
+  9. (v6.2) Consciência de NOT NULL (corrige ORA-01400): o pipeline tratava
+     "não-PK" como "anulável", mas colunas NOT NULL fora da PK
+     (CONDICAO_IF.NUM_IF, ESPECIFICACAO_COMITENTE/CARTEIRA_COMITENTE.
+     NUM_ID_ENTIDADE, OPERACAO.NUM_CONTA_PARTICIPANTE_P1/P2) eram anuladas ao
+     neutralizar órfãos — passava no gate (NULL em FK não é órfão) e estourava
+     ORA-01400 no load. Agora o conjunto NOT NULL de cada tabela = PK ∪
+     declaradas em `not_null_cols` (opcional no spec_config) ∪ inferidas
+     (0 nulos na fonte). neutraliza_orfaos_na_fonte e null_orphan_fks NUNCA
+     anulam coluna NOT NULL: se a FK não tem coluna anulável, a órfã é
+     REATRIBUÍDA a uma chave válida do pai. O gate final barra qualquer NULL
+     remanescente em coluna NOT NULL antes de gravar (backstop). Over-inferir
+     NOT NULL é seguro — só força mais realocação, que nunca cria null.
 """
 
 from __future__ import annotations
@@ -3074,6 +3097,59 @@ def _fk_colunas_ok(child_df: DataFrame, parent_df: DataFrame,
     return True
 
 
+def _declared_not_null(cfg: dict) -> set:
+    """Colunas NOT NULL declaradas no spec_config (opcional).
+
+    Aceita `not_null_cols` (ou `not_null`) por tabela: lista de colunas que o
+    destino Oracle marca como NOT NULL mas que NÃO fazem parte da PK. É a
+    fonte AUTORITATIVA — se você souber quais são, declare-as e o gate as
+    trata como erro fatal se saírem nulas.
+    """
+    raw = cfg.get("not_null_cols")
+    if raw is None:
+        raw = cfg.get("not_null")
+    if raw is None:
+        return set()
+    if isinstance(raw, str):
+        raw = [raw]
+    return {str(c).strip() for c in raw if str(c).strip()}
+
+
+def _infer_not_null_cols(df: DataFrame) -> set:
+    """Infere colunas NOT NULL: aquelas com ZERO nulos na fonte.
+
+    Uma coluna NOT NULL no Oracle nunca tem null na origem (os dados vieram
+    de lá), então 0 nulos na fonte é um indicador confiável. Over-inferir
+    (uma coluna anulável que por acaso não tem null na amostra) é SEGURO:
+    apenas força realocação de órfão em vez de anulação — e realocação nunca
+    introduz null. Sub-inferir seria o perigo (anular uma NOT NULL real ->
+    ORA-01400); por isso a inferência peca para o lado seguro.
+
+    Uma única ação (agg) conta os nulos de todas as colunas de uma vez.
+    """
+    cols = df.columns
+    if not cols:
+        return set()
+    row = df.agg(*[
+        F.sum(F.col(c).isNull().cast("long")).alias(c) for c in cols
+    ]).collect()[0]
+    return {c for c in cols if (row[c] or 0) == 0}
+
+
+def _not_null_cols_for(cfg: dict, df: Optional[DataFrame]) -> set:
+    """Conjunto NOT NULL efetivo de uma tabela: PK ∪ declaradas ∪ inferidas.
+
+    PK é implicitamente NOT NULL. As declaradas vêm do spec_config. As
+    inferidas vêm de 0 nulos na fonte (df), quando fornecida. A união é a
+    base para (a) decidir se uma FK órfã pode ser anulada ou precisa ser
+    reatribuída e (b) o gate final barrar qualquer NULL em coluna NOT NULL.
+    """
+    out = set(cfg.get("pk_cols") or []) | _declared_not_null(cfg)
+    if df is not None:
+        out |= _infer_not_null_cols(df)
+    return out
+
+
 def _realoca_fk_para_pais_validos(
     child_df: DataFrame,
     parent_df: DataFrame,
@@ -3363,6 +3439,14 @@ def neutraliza_orfaos_na_fonte(comp_specs, sampled: dict,
             continue
         cfg = comp_specs[table]
         pk_set = set(cfg.get("pk_cols") or [])
+        # NOT NULL awareness: nunca anular uma coluna NOT NULL do destino
+        # (PK, declarada em not_null_cols ou sem nenhum null na fonte). Anular
+        # essas colunas passava no gate (NULL em FK não é órfão) mas estourava
+        # ORA-01400 no load — foi a causa real dos erros em CONDICAO_IF.NUM_IF,
+        # ESPECIFICACAO_COMITENTE/CARTEIRA_COMITENTE.NUM_ID_ENTIDADE e
+        # OPERACAO.NUM_CONTA_PARTICIPANTE_P1/P2. Over-inferir é seguro (só
+        # força realocação, que nunca cria null).
+        not_null_set = _not_null_cols_for(cfg, df)
         changed = False
         for fk in _fk_list(cfg):
             parent = fk.get("parent_table")
@@ -3384,7 +3468,12 @@ def neutraliza_orfaos_na_fonte(comp_specs, sampled: dict,
             if orfas.isEmpty():
                 continue
 
-            nullable_cols = [c for c in cols if c not in pk_set]
+            # Só é "anulável" a coluna que NÃO é PK e NÃO é NOT NULL. Se a FK
+            # não tiver nenhuma coluna anulável (single-col NOT NULL, ou todas
+            # NOT NULL/PK), a única saída segura é REATRIBUIR — anular daria
+            # ORA-01400.
+            nullable_cols = [c for c in cols
+                             if c not in pk_set and c not in not_null_set]
             usa_realocacao = (modo_orfao == "reassign") or not nullable_cols
 
             # Join por igualdade nas colunas da FK: linhas com FK nula nunca
@@ -3588,7 +3677,7 @@ def completa_pais_referenciados(
     return sampled
 
 
-def bind_shared_key_children(synthetic: dict, comp_specs: dict) -> dict:
+def bind_shared_key_children(synthetic: dict, comp_specs: dict):
     """Rebind 1:1 shared-key children (PK == FK) to distinct synthetic parent keys.
 
     For a table whose primary key IS its FK to a parent (e.g. JUROS_FLUTUANTE /
@@ -3600,7 +3689,28 @@ def bind_shared_key_children(synthetic: dict, comp_specs: dict) -> dict:
 
     v6: percorre em ordem TOPOLÓGICA (determinístico e coerente com os demais
     passes) e ganha a guarda de colunas (_fk_colunas_ok).
+
+    v6.1 — correções críticas de consistência:
+      1. MATERIALIZAÇÃO: as chaves do pai e o pareamento (joined) saem em
+         localCheckpoint(eager). O rebind numera linhas por POSIÇÃO sobre
+         planos com shuffle (distinct/joins), cuja ordem intra-partição NÃO
+         é estável entre avaliações; sem congelar, cada consumidor (binds de
+         filhas, null_orphan_fks, gate, gravação) reavaliava o plano e podia
+         enxergar um pareamento DIFERENTE — origem de órfãos fantasma
+         detectados só no gate (ex.: 286 órfãs em IDENTIFICACAO_ISPB ->
+         PESSOA_JURIDICA logo após passes que zeraram órfãos).
+      2. MAPA chave_antiga -> chave_nova: o rebind troca as chaves da tabela
+         DEPOIS que a síntese já remapeou as filhas para as chaves antigas.
+         O mapa capturado aqui (antes do overwrite) permite que
+         remapeia_filhas_pos_bind TRADUZA as FKs das filhas — antes viravam
+         todas órfãs e o null_orphan_fks as anulava em massa (todas as
+         *_ATUALIZ -> USUARIO etc. do log).
+
+    Retorna (synthetic, bind_maps), onde bind_maps =
+    {(tabela, frozenset(pk_cols)): DataFrame com __bind_old__<col> /
+    __bind_new__<col>}.
     """
+    bind_maps: dict = {}
     for child in topo_order_tables(comp_specs):
         cfg = comp_specs[child]
         child_df = synthetic.get(child)
@@ -3627,46 +3737,176 @@ def bind_shared_key_children(synthetic: dict, comp_specs: dict) -> dict:
             # _with_contiguous_row_id dá id contíguo 0..N-1 bijetivo dos dois
             # lados; o inner join pareia 1:1 e descarta filhos acima do nº de
             # chaves do pai (mesma cardinalidade documentada), sem sort global.
+            # Congela as chaves do pai ANTES da numeração: o distinct tem
+            # shuffle, e a ordem intra-partição de um shuffle não é estável
+            # entre avaliações — _with_contiguous_row_id avalia o frame mais
+            # de uma vez (collect de tamanhos + join final).
             keys = (parent_df
                     .select(*[F.col(pc).alias(f"__np{i}") for i, pc in enumerate(pcols)])
-                    .dropna().distinct())
+                    .dropna().distinct()
+                    .localCheckpoint(eager=True))
+            # GUARDA ANTI-ZERAGEM: se o pai não tem nenhuma chave válida, o
+            # inner join abaixo zeraria a filha. Isso é impossível para FK
+            # whole-PK (a PK sintética nunca é nula) enquanto o pai tiver
+            # linhas — mas se acontecer (pai vazio/degenerado), PULA o rebind
+            # em vez de zerar; null_orphan_fks + gate cuidam do resíduo.
+            if keys.isEmpty():
+                logger.error(
+                    "bind_shared_key_children: %s.%s -> %s: pai sem chave "
+                    "válida; rebind PULADO para não zerar a filha (%d linha(s) "
+                    "preservadas).",
+                    child, ",".join(cols), parent, child_df.count())
+                continue
             keys = _with_contiguous_row_id(keys, "__bind_rn")
 
             numbered = _with_contiguous_row_id(child_df, "__bind_rn")
 
-            joined = numbered.join(keys, "__bind_rn", "inner")
+            # Congela o PAREAMENTO: todos os consumidores (mapa old->new,
+            # rebind desta tabela, binds de filhas, null_orphan_fks, gate,
+            # gravação) enxergam exatamente as mesmas linhas.
+            joined = (numbered.join(keys, "__bind_rn", "inner")
+                      .localCheckpoint(eager=True))
+
+            # Mapa chave_antiga -> chave_nova, capturado ANTES do overwrite
+            # (linhas com chave antiga completa; primeira ocorrência vence).
+            old_names = [f"__bind_old__{c}" for c in cols]
+            pares = (joined
+                     .select(*[F.col(c).alias(f"__bind_old__{c}") for c in cols],
+                             *[F.col(f"__np{i}").alias(f"__bind_new__{c}")
+                               for i, c in enumerate(cols)])
+                     .dropna(subset=old_names)
+                     .dropDuplicates(old_names))
+            key_map = (child, frozenset(cols))
+            anterior = bind_maps.get(key_map)
+            if anterior is not None:
+                # Tabela rebindada mais de uma vez (FKs whole-PK para pais
+                # distintos): compõe old -> mid -> new; chave sem tradução
+                # no 2º mapa mantém a do 1º (resíduo fica p/ null_orphan).
+                logger.warning(
+                    "bind_shared_key_children: %s rebindada mais de uma vez; "
+                    "compondo mapas de chaves.", child)
+                cond_comp = reduce(
+                    lambda a, b: a & b,
+                    [anterior[f"__bind_new__{c}"].eqNullSafe(
+                        pares[f"__bind_old__{c}"]) for c in cols])
+                pares = anterior.join(pares, cond_comp, "left").select(
+                    *[anterior[f"__bind_old__{c}"] for c in cols],
+                    *[F.coalesce(pares[f"__bind_new__{c}"],
+                                 anterior[f"__bind_new__{c}"])
+                      .alias(f"__bind_new__{c}") for c in cols],
+                )
+            bind_maps[key_map] = pares.localCheckpoint(eager=True)
+
             for i, c in enumerate(cols):
                 joined = joined.withColumn(c, F.col(f"__np{i}"))
             child_df = joined.drop("__bind_rn", *[f"__np{i}" for i in range(len(pcols))])
         synthetic[child] = child_df
+    return synthetic, bind_maps
+
+
+def remapeia_filhas_pos_bind(synthetic: dict, comp_specs: dict,
+                             bind_maps: dict) -> dict:
+    """Traduz as FKs das filhas para as chaves PÓS-bind dos pais rebindados.
+
+    bind_shared_key_children troca as CHAVES das tabelas 1:1 (ex.: USUARIO e
+    PESSOA_JURIDICA rebindadas para as chaves de ENTIDADE) DEPOIS que a
+    síntese já remapeou todas as filhas para as chaves antigas. Sem este
+    passe, toda FK que referencia uma tabela rebindada (as dezenas de
+    *_ATUALIZ -> USUARIO, POSICAO_LIQUIDACAO -> PESSOA_JURIDICA etc.) virava
+    órfã e o null_orphan_fks a ANULAVA em massa — perda de dado gigantesca,
+    ainda que "load-safe".
+
+    Aqui cada valor de FK é traduzido chave_antiga -> chave_nova com o mapa
+    capturado no bind. Só o resíduo sem tradução (chave antiga que não
+    sobreviveu ao rebind, ex.: linha descartada pela cardinalidade 1:1) fica
+    para o null_orphan_fks anular/realocar.
+
+    FKs whole-PK são puladas: as próprias tabelas rebindadas já apontam para
+    as chaves PÓS-bind do pai (o bind corre em ordem topológica e lê o pai
+    já rebindado do dict). Nenhuma linha é adicionada ou removida.
+    """
+    if not bind_maps:
+        return synthetic
+    for child in topo_order_tables(comp_specs):
+        cfg = comp_specs[child]
+        child_df = synthetic.get(child)
+        if child_df is None:
+            continue
+        pk_cols = list(cfg.get("pk_cols") or [])
+        mudou = False
+        for fk in _fk_list(cfg):
+            parent = fk.get("parent_table")
+            cols = list(fk.get("columns") or [])
+            pcols = list(fk.get("parent_columns") or [])
+            if not cols or len(cols) != len(pcols):
+                continue
+            mapa = bind_maps.get((parent, frozenset(pcols)))
+            if mapa is None:
+                continue
+            if _fk_is_whole_pk(pk_cols, fk):
+                # Rebindada positionalmente para o pai PÓS-bind (ordem
+                # topológica) — traduzir de novo estragaria; e no caso self
+                # a tradução reescreveria a PK inteira.
+                continue
+            if any(c not in child_df.columns for c in cols):
+                continue
+            cond = reduce(
+                lambda a, b: a & b,
+                [child_df[cols[i]].eqNullSafe(mapa[f"__bind_old__{pc}"])
+                 for i, pc in enumerate(pcols)])
+            joined = child_df.join(mapa, cond, "left")
+            for c, pc in zip(cols, pcols):
+                tipo = child_df.schema[c].dataType
+                joined = joined.withColumn(
+                    c,
+                    F.when(F.col(f"__bind_new__{pc}").isNotNull(),
+                           F.col(f"__bind_new__{pc}").cast(tipo))
+                     .otherwise(F.col(c)),
+                )
+            child_df = joined.drop(
+                *[f"__bind_old__{pc}" for pc in pcols],
+                *[f"__bind_new__{pc}" for pc in pcols])
+            mudou = True
+            logger.info(
+                "remapeia_filhas_pos_bind: %s.%s -> %s traduzida para as "
+                "chaves pós-bind do pai.", child, ",".join(cols), parent)
+        if mudou:
+            # Congela: consumidores downstream (null_orphan, gate, gravação)
+            # enxergam exatamente as mesmas linhas.
+            synthetic[child] = child_df.localCheckpoint(eager=True)
     return synthetic
 
 
-def null_orphan_fks(synthetic: dict, comp_specs: dict) -> dict:
+def null_orphan_fks(synthetic: dict, comp_specs: dict,
+                    not_null_by_table: dict | None = None) -> dict:
     """Neutraliza FK órfã no resultado sintético SEM REMOVER LINHAS.
 
     Catches references the synthesizer could not remap — self-references,
     relationships it ignored (source orphans / parent absent), and residual
     sampling orphans — so the load doesn't hit a parent-key-not-found violation.
 
-    Regras por FK:
-      - FK com coluna anulável (fora da PK): anula APENAS as colunas não-PK
-        das linhas órfãs. Sob Oracle MATCH SIMPLE uma única coluna NULL
-        desliga a checagem composta; as colunas de PK ficam intactas.
+    Regras por FK (NOT NULL-aware — not_null_by_table[child] = PK ∪ declaradas
+    ∪ inferidas-da-fonte):
+      - FK com ao menos uma coluna ANULÁVEL (não-PK e não-NOT NULL): anula
+        apenas essas colunas nas linhas órfãs. Sob Oracle MATCH SIMPLE uma
+        única coluna NULL desliga a checagem composta; PK e NOT NULL ficam
+        intactas.
       - FK cujas colunas são exatamente a PK inteira: território de
         bind_shared_key_children (1:1), que já garantiu chaves válidas.
-      - FK cujas colunas estão TODAS dentro da PK mas NÃO são a PK inteira
-        (ex.: LANCAMENTO.NUM_ID_ENTIDADE em PK composta): não dá para anular
-        (NOT NULL) nem rebindar (não é 1:1). v6: as linhas órfãs são
-        REATRIBUÍDAS a chaves válidas do pai sintético — antes eram
-        simplesmente puladas e vazavam órfãs para o load (ORA-02291);
-        dropar podia encadear e zerar tabelas. A unicidade da PK composta
-        segue garantida pela última coluna da PK, gerada sequencialmente
-        pela síntese; o gate final confere.
+      - FK SEM nenhuma coluna anulável (single-col NOT NULL como
+        CONDICAO_IF.NUM_IF / OPERACAO.NUM_CONTA_PARTICIPANTE_P*, ou colunas
+        todas dentro da PK como LANCAMENTO.NUM_ID_ENTIDADE): não dá para
+        anular (ORA-01400) nem, em geral, rebindar 1:1. As linhas órfãs são
+        REATRIBUÍDAS a chaves válidas do pai sintético — nunca dropa (dropar
+        encadeava e zerava tabelas), nunca anula (ORA-01400). A unicidade da
+        PK composta segue garantida pela última coluna da PK, gerada
+        sequencialmente pela síntese; o gate final confere.
 
-    v6: percorre em ordem TOPOLÓGICA e checa órfãos com anti-join de chaves
-    distintas + isEmpty antes de reescrever a filha (barato quando limpo).
+    v6.1: percorre em ordem TOPOLÓGICA, respeita NOT NULL (nunca anula coluna
+    NOT NULL) e checa órfãos com anti-join de chaves distintas + isEmpty
+    antes de reescrever a filha (barato quando limpo).
     """
+    not_null_by_table = not_null_by_table or {}
     for child in topo_order_tables(comp_specs):
         cfg = comp_specs[child]
         child_df = synthetic.get(child)
@@ -3674,6 +3914,9 @@ def null_orphan_fks(synthetic: dict, comp_specs: dict) -> dict:
             continue
         pk_cols = list(cfg.get("pk_cols") or [])
         pk_set = set(pk_cols)
+        # NOT NULL efetivo do filho: nunca anular essas colunas (ORA-01400).
+        not_null_set = set(not_null_by_table.get(child) or []) | pk_set
+        mudou = False
         for fk in _fk_list(cfg):
             parent = fk.get("parent_table")
             parent_df = synthetic.get(parent)
@@ -3684,7 +3927,7 @@ def null_orphan_fks(synthetic: dict, comp_specs: dict) -> dict:
             if not _fk_colunas_ok(child_df, parent_df, cols, pcols, child, parent):
                 continue
 
-            nullable_cols = [c for c in cols if c not in pk_set]
+            nullable_cols = [c for c in cols if c not in not_null_set]
             tratada_pelo_bind = (
                 not nullable_cols
                 and parent != child
@@ -3710,15 +3953,17 @@ def null_orphan_fks(synthetic: dict, comp_specs: dict) -> dict:
 
             if nullable_cols:
                 logger.warning(
-                    "null_orphan_fks: %s.%s -> %s: anulando colunas não-PK "
-                    "da FK nas linhas órfãs residuais.",
-                    child, ",".join(cols), parent)
+                    "null_orphan_fks: %s.%s -> %s: anulando colunas ANULÁVEIS "
+                    "(%s) da FK nas linhas órfãs residuais (PK/NOT NULL "
+                    "preservadas).",
+                    child, ",".join(cols), parent, ",".join(nullable_cols))
                 for c in nullable_cols:
                     joined = joined.withColumn(
                         c, F.when(F.col("__orf"),
                                   F.lit(None).cast(child_df.schema[c].dataType))
                             .otherwise(F.col(c)))
                 child_df = joined.drop("__orf")
+                mudou = True
             else:
                 # FK dentro da PK (mas não a PK inteira): reatribui para
                 # chave válida do pai sintético — nunca dropa.
@@ -3734,7 +3979,6 @@ def null_orphan_fks(synthetic: dict, comp_specs: dict) -> dict:
                         "sintético sem chave válida; linhas mantidas — o gate "
                         "final aborta antes da gravação.",
                         child, ",".join(cols), parent)
-                    child_df = joined.drop("__orf")
                 else:
                     logger.warning(
                         "null_orphan_fks: %s.%s -> %s: FK dentro da PK "
@@ -3742,7 +3986,15 @@ def null_orphan_fks(synthetic: dict, comp_specs: dict) -> dict:
                         "válidas do pai (contagem preservada).",
                         child, ",".join(cols), parent)
                     child_df = realocado
-        synthetic[child] = child_df
+                    mudou = True
+        if mudou:
+            # Congela o resultado: os joins de anulação/realocação usam rand
+            # e planos profundos; sem materializar, o gate e a gravação
+            # reavaliariam o plano e poderiam enxergar linhas DIFERENTES das
+            # verificadas aqui (órfãos fantasma no gate).
+            synthetic[child] = child_df.localCheckpoint(eager=True)
+        else:
+            synthetic[child] = child_df
     return synthetic
 
 
@@ -3751,6 +4003,7 @@ def valida_e_reporta_saida(
     comp_specs: dict,
     *,
     source_counts: dict | None = None,
+    not_null_by_table: dict | None = None,
     strict: bool = True,
 ) -> None:
     """Gate final por componente ANTES da gravação: relatório + abortagem.
@@ -3760,7 +4013,10 @@ def valida_e_reporta_saida(
         (drops encadeados já causaram isso no passado; nenhum passe v6
         remove linhas, mas o gate cobre qualquer mecanismo não mapeado);
       - PK: nenhuma linha com PK nula, nenhuma PK duplicada;
-      - FK: nenhuma linha órfã (NULL em FK anulável é permitido — FK
+      - NOT NULL: nenhuma coluna NOT NULL (PK ∪ declaradas ∪ inferidas da
+        fonte, via not_null_by_table) pode sair nula — é o backstop contra
+        ORA-01400 que o passe de órfãos deveria ter evitado;
+      - FK: nenhuma linha órfã (NULL em FK ANULÁVEL é permitido — FK
         opcional, MATCH SIMPLE).
 
     Loga um resumo por tabela e por FK (é o QA que antes era feito na mão).
@@ -3769,6 +4025,7 @@ def valida_e_reporta_saida(
     ORA-00001/ORA-01400/ORA-02291 no load do banco.
     """
     source_counts = source_counts or {}
+    not_null_by_table = not_null_by_table or {}
     problemas: list[str] = []
 
     for table, cfg in comp_specs.items():
@@ -3794,6 +4051,23 @@ def valida_e_reporta_saida(
             if total - distintas:
                 problemas.append(
                     f"{table}: {total - distintas} linha(s) com PK duplicada")
+
+        # NOT NULL: nenhuma coluna NOT NULL do destino pode sair nula (senão
+        # ORA-01400 no load). Uma única agg conta os nulos de todas de uma vez.
+        nn_present = [c for c in (set(not_null_by_table.get(table) or [])
+                                  | set(cfg.get("pk_cols") or []))
+                      if c in df.columns]
+        if nn_present and total > 0:
+            row = df.agg(*[
+                F.sum(F.col(c).isNull().cast("long")).alias(c)
+                for c in nn_present
+            ]).collect()[0]
+            for c in sorted(nn_present):
+                n_nulos = row[c] or 0
+                if n_nulos:
+                    problemas.append(
+                        f"{table}.{c}: {n_nulos} linha(s) com NULL em coluna "
+                        f"NOT NULL")
 
         for fk in _fk_list(cfg):
             parent = fk.get("parent_table")
@@ -3973,16 +4247,35 @@ def engorda(spark, config, specs, scale_factor, seed, continue_on_error,
                 # localCheckpoint. The full run keeps persist (recomputable).
                 truncate_lineage=(limit is not None),
             )
-            synthetic = bind_shared_key_children(synthetic, comp_specs)
+            synthetic, bind_maps = bind_shared_key_children(synthetic, comp_specs)
+            # Traduz as FKs das filhas para as chaves PÓS-bind dos pais
+            # rebindados ANTES do passe de órfãos: sem isso, toda FK que
+            # referencia uma tabela rebindada (ex.: *_ATUALIZ -> USUARIO)
+            # virava órfã e era anulada em massa pelo null_orphan_fks.
+            synthetic = remapeia_filhas_pos_bind(synthetic, comp_specs, bind_maps)
+            # NOT NULL por tabela: PK ∪ declaradas (spec) ∪ inferidas (0 nulos
+            # na fonte amostrada). Impede que null_orphan_fks anule qualquer
+            # coluna NOT NULL do destino (ORA-01400) e alimenta o gate como
+            # backstop. Inferir de comp_tables (fonte que alimenta a síntese)
+            # mantém o gate consistente: coluna 0-null na fonte -> 0-null na
+            # saída, pois o bootstrap copia valores e a anulação de órfão
+            # agora respeita esse conjunto.
+            not_null_by_table = {
+                t: _not_null_cols_for(comp_specs[t], comp_tables.get(t))
+                for t in comp
+            }
             # Self-FKs genuínas são remapeadas DENTRO da síntese (mapping
             # old->new da própria tabela), preservando estrutura e
-            # auto-loops; null_orphan_fks segue como rede de segurança.
-            synthetic = null_orphan_fks(synthetic, comp_specs)
-            # Gate final: PK única/não nula, FK sem órfãos e nenhuma tabela
-            # vazia — ANTES de gravar qualquer coisa deste componente.
+            # auto-loops; null_orphan_fks segue como rede de segurança,
+            # ciente das colunas NOT NULL (reatribui em vez de anular).
+            synthetic = null_orphan_fks(synthetic, comp_specs, not_null_by_table)
+            # Gate final: PK única/não nula, NENHUMA coluna NOT NULL nula, FK
+            # sem órfãos e nenhuma tabela vazia — ANTES de gravar qualquer
+            # coisa deste componente.
             valida_e_reporta_saida(
                 synthetic, comp_specs,
                 source_counts=counts,
+                not_null_by_table=not_null_by_table,
                 strict=not skip_final_validation,
             )
             for name, df in synthetic.items():
